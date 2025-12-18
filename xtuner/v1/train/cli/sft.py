@@ -10,6 +10,9 @@ from xtuner.v1.train.trainer import Trainer
 from xtuner.v1.utils import Config
 from xtuner.v1.utils.misc import monkey_patch_hf_modules_cache
 
+import faulthandler
+faulthandler.enable()
+
 
 app = App(
     help="XTuner's entry point for fine-tuning and training, launched using configuration files or arguments.",

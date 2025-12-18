@@ -100,7 +100,8 @@ def build_datasets(dataset_config: DatasetConfigList, tokenizer) -> list[JsonlDa
     datasets: list[JsonlDataset] = []
     assert len(dataset_config) > 0
 
-    tokenizer_hash = tokenizer_xxhash(tokenizer)[:16]
+    # tokenizer_hash = tokenizer_xxhash(tokenizer)[:16]
+    tokenizer_hash = "52efd4e6476d1776"
     for config in dataset_config:
         _dataset_config = config["dataset"]
         assert isinstance(_dataset_config, DatasetConfig)

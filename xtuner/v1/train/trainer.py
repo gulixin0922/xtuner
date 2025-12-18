@@ -544,7 +544,7 @@ class Trainer:
         # After init logger
         logger.warning("`resume_cfg` is deprecated, please use `auto_resume` and `load_checkpoint_cfg` instead")
 
-        self._try_bind_numa()
+        # self._try_bind_numa()
         self._set_deterministic()
         self._set_random_seed(seed)
         self._setup_env()
@@ -588,6 +588,9 @@ class Trainer:
             seed=seed,
             total_step=total_step,
         )
+        
+        import gc
+        gc.collect()
 
         # streaming dataloader may override `total_step`, so we may move this check after `build_dataloader` later.
         assert total_epoch is not None or total_step is not None, "`total_epoch` or `total_step` should be set"

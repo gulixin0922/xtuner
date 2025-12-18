@@ -6,6 +6,8 @@ export XTUNER_USE_FA3=1
 export TORCH_LOGS="recompiles"
 export PYTHONPATH="$(pwd)"
 export HF_HOME="$(pwd)/"
+ulimit -n 65535
+ulimit -u 65535
 
 config_file=$1
 
