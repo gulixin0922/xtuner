@@ -1311,7 +1311,7 @@ class Trainer:
             return  # try_bind_numa should not raise exception
         else:
             logger.info(f"Rank: {self.rank} success bind process to numa node: {numa_id}")
-
+            
     def _init_dist(self, backend: str | None = None):
         if backend is None:
             if torch.accelerator.current_accelerator().type == "cuda":
@@ -1324,6 +1324,21 @@ class Trainer:
         if not dist.is_initialized():
             init_process_group(backend=backend)
         torch.accelerator.set_device_index(int(os.environ["LOCAL_RANK"]))
+        test_tensor = torch.ones(4, 4, device='cuda' if torch.accelerator.current_accelerator().type == "cuda" else 'npu')
+        dist.all_reduce(test_tensor)
+
+    # def _init_dist(self, backend: str | None = None):
+    #     if backend is None:
+    #         if torch.accelerator.current_accelerator().type == "cuda":
+    #             backend = "cpu:gloo,cuda:nccl"
+    #         elif torch.accelerator.current_accelerator().type == "npu":
+    #             backend = "cpu:gloo,npu:hccl"
+    #         else:
+    #             raise NotImplementedError
+
+    #     if not dist.is_initialized():
+    #         init_process_group(backend=backend)
+    #     torch.accelerator.set_device_index(int(os.environ["LOCAL_RANK"]))
 
     def _init_xtuner_meta(self, work_dir: Path, auto_resume: bool) -> XTunerMeta:
         if not work_dir.exists():
