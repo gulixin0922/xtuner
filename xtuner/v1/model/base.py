@@ -1,6 +1,7 @@
 import json
 import math
 import pydoc
+import re
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from functools import reduce
 from importlib import import_module
@@ -18,7 +19,13 @@ from more_itertools import consume
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import ConfigDict, computed_field
 from safetensors.torch import save_file
-from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed.fsdp import (
+    CPUOffloadPolicy,
+    FSDPModule,
+    MixedPrecisionPolicy,
+    fully_shard,
+)
 from torch.distributed.tensor import DTensor, Placement, Shard
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 from typing_extensions import NotRequired, Self, TypedDict
@@ -27,13 +34,12 @@ from transformers.configuration_utils import PretrainedConfig
 from xtuner.v1.config import FSDPConfig, GenerateConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.float8.config import Float8Config
-from xtuner.v1.float8.float8_handler import Float8Handler
 from xtuner.v1.float8.fsdp_utils import (
     WeightWithDynamicTensorWiseFloat8CastTensor,
     WeightWithDynamicTilewiseFloat8CastTensor,
 )
 from xtuner.v1.loss import BaseLossContext
-from xtuner.v1.module.attention import MHAConfig, MLAConfig
+from xtuner.v1.module.attention import GatedDeltaNetConfig, MHAConfig, MLAConfig
 from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.ops.comm.foreach_allgather import foreach_all_gather
 from xtuner.v1.utils import get_device, get_logger, get_torch_device_module, profile_time_and_memory
@@ -79,9 +85,42 @@ class XTunerBaseModelConfig(PydanticBaseModel):
             "`dict[str, TorchCompileOption]`: Customize the compile option",
         ),
     ] = None
+    hf_key_mapping: Annotated[dict[str, str] | None, "Remapping hf key based on the `to_hf_key_list`"] = None
+    dcp_ignore_frozen_params: bool = True
 
     @property
     def hf_config(self) -> PretrainedConfig | None:
+        return None
+
+    def save_hf(self, hf_path: str | Path):
+        if self.hf_config is None:
+            raise NotImplementedError("The `hf_config` property must be implemented to save in HuggingFace format.")
+
+        self.hf_config.save_pretrained(hf_path)
+
+    @classmethod
+    def from_hf(cls, hf_path: str | Path) -> Self:
+        """Build a `TransformerConfig` from a pre-trained HuggingFace model.
+
+        This method creates a configuration object based on a `PretrainedConfig` loaded from the specified HuggingFace model path.
+        If you want to use this method, you must implement it in a subclass to correctly extract and map configuration parameters.
+
+        Note:
+            The `hf_config` field needs to be set to the `PretrainedConfig` object loaded from `hf_path`,
+            otherwise it cannot be saved in HuggingFace format.
+
+        Args:
+            hf_path (str | Path): Path to the HuggingFace model.
+
+        Returns:
+            TransformerConfig: A configuration object populated with values from the pre-trained model.
+
+        Raises:
+            NotImplementedError: This method must be implemented by subclasses.
+        """
+        raise NotImplementedError
+
+    def build(self):
         raise NotImplementedError
 
 
@@ -108,9 +147,11 @@ class TransformerConfig(XTunerBaseModelConfig):
     hidden_size: Annotated[int, Parameter(group="model")]
     intermediate_size: Annotated[int, Parameter(group="model")]
     rms_norm_eps: Annotated[float, Parameter(group="model")]
+    rms_norm_type: Annotated[Literal["default", "zero_centered"], Parameter(group="model")] = "default"
     rope_theta: Annotated[float, Parameter(group="model")]  # required by transformers's build rope
     hidden_act: Annotated[str, Parameter(group="model")]  # key defined in `transformers.activations.ACT2CLS`
     attention: MLAConfig | MHAConfig
+    linear_attention: Annotated[GatedDeltaNetConfig | None, Parameter(group="model")] = None
     mlp_bias: Annotated[bool, Parameter(group="model")] = False
     tie_word_embeddings: Annotated[bool, Parameter(group="model")] = False
     model_type: Annotated[str | None, Parameter(group="model")] = None  # TODO: yehaochen maybe should be removed
@@ -119,10 +160,16 @@ class TransformerConfig(XTunerBaseModelConfig):
     use_sliding_window: Annotated[bool, Parameter(group="model")] = False
     max_window_layers: Annotated[int | None, Parameter(group="model")] = None
     rope_scaling_cfg: RopeScalingConfig | None = None
-    dcp_ignore_frozen_params: Annotated[bool, Parameter(group="model")] = False
     mesh_prefix: Annotated[str, Parameter(help="Prefix for device mesh configuration in distributed training")] = (
         "default"
     )
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def rope_scaling(self) -> dict | None:
+        if self.rope_scaling_cfg is not None:
+            return self.rope_scaling_cfg.model_dump()
+        return None
 
     @computed_field
     def num_attention_heads(self) -> int:
@@ -137,7 +184,7 @@ class TransformerConfig(XTunerBaseModelConfig):
         return self.attention.head_dim
 
     @computed_field
-    def layers_type(self) -> list[Literal["full_attention", "sliding_attention"]]:
+    def layers_type(self) -> list[Literal["full_attention", "sliding_attention", "linear_attention"]]:
         if not self.use_sliding_window:
             return ["full_attention"] * self.num_hidden_layers
         else:
@@ -147,48 +194,6 @@ class TransformerConfig(XTunerBaseModelConfig):
                 "sliding_attention" if i >= self.max_window_layers else "full_attention"
                 for i in range(self.num_hidden_layers)
             ]
-
-    def build(self) -> "BaseModel":
-        raise NotImplementedError
-
-    @classmethod
-    def from_hf(cls, hf_path: str | Path) -> Self:
-        """Build a `TransformerConfig` from a pre-trained HuggingFace model.
-
-        This method creates a configuration object based on a `PretrainedConfig` loaded from the specified HuggingFace model path.
-        If you want to use this method, you must implement it in a subclass to correctly extract and map configuration parameters.
-
-        Note:
-            The `hf_config` field needs to be set to the `PretrainedConfig` object loaded from `hf_path`,
-            otherwise it cannot be saved in HuggingFace format.
-
-        Args:
-            hf_path (str | Path): Path to the HuggingFace model.
-
-        Returns:
-            TransformerConfig: A configuration object populated with values from the pre-trained model.
-
-        Raises:
-            NotImplementedError: This method must be implemented by subclasses.
-        """
-        raise NotImplementedError
-
-    @property
-    def hf_config(self) -> PretrainedConfig | None:
-        """HuggingFace configuration."""
-        return None
-
-    def save_hf(self, hf_path: str | Path):
-        """Save the configuration to a HuggingFace-compatible format.
-
-        Args:
-            hf_path (str | Path): Path where the configuration should be saved.
-        """
-
-        if self.hf_config is None:
-            raise NotImplementedError("The `hf_config` property must be implemented to save in HuggingFace format.")
-
-        self.hf_config.save_pretrained(hf_path)
 
 
 class ModelOutputs(TypedDict):
@@ -242,7 +247,11 @@ class BaseModel(nn.Module):
     def set_hf(self, hf_path: str | Path):
         self._hf_path = Path(hf_path)
 
-    def from_hf(self, hf_path: str | Path, strict: bool = True) -> tuple:
+    def from_hf(
+        self, hf_path: str | Path, strict: bool = True
+    ) -> tuple[
+        Annotated[set[str], "loaded keys"], Annotated[set[str], "unloaded keys"], Annotated[set[str], "missing keys"]
+    ]:
         self._hf_path = Path(hf_path)
 
         if isinstance(hf_path, Path):
@@ -265,10 +274,42 @@ class BaseModel(nn.Module):
     def fully_shard(
         self,
         fsdp_config: FSDPConfig,
-        float8_handler: Float8Handler | None = None,
-    ) -> "BaseModel":
+    ) -> Self:
         """Fully shard the model parameters."""
-        raise NotImplementedError
+        self.fsdp_config = fsdp_config
+        self.fsdp_mesh = self._init_world_mesh()
+
+        if self.fsdp_config.requires_grad:
+            for name, module in self.named_modules():
+                # if "ts_model" in name:
+                #     torch.distributed.breakpoint()
+                for p_name, param in module.named_parameters(recurse=False):
+                    if param.requires_grad:
+                        param_fp32 = torch.nn.Parameter(param.to(dtype=torch.float32))
+                        setattr(module, p_name, param_fp32)
+        else:
+            for param in self.parameters():
+                param.requires_grad = False
+
+        mp_policy = MixedPrecisionPolicy(param_dtype=fsdp_config.param_dtype, reduce_dtype=fsdp_config.reduce_dtype)
+
+        for module in self.modules():
+            if module is self:
+                continue
+            if isinstance(module, BaseModel):
+                module.fully_shard(fsdp_config)
+
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=self.fsdp_config.param_dtype, reduce_dtype=fsdp_config.reduce_dtype
+        )
+        fully_shard(
+            self,
+            mesh=self.fsdp_mesh,
+            mp_policy=mp_policy,
+            reshard_after_forward=fsdp_config.reshard_after_forward,
+            offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+        )
+        return self
 
     def save_hf(self, hf_dir: Path | str, save_dtype: torch.dtype = torch.bfloat16, safetensors_prefix: str = "model"):
         with profile_time_and_memory(f"[Saving HF to [{safetensors_prefix}]{hf_dir} cost]"):
@@ -341,7 +382,7 @@ class BaseModel(nn.Module):
         from xtuner.v1.utils import default_init_weights
 
         initialized_params = default_init_weights(self)
-        if missing := {name for name, _ in self.named_parameters()} - initialized_params:
+        if missing := {self._clean_param_name(name) for name, _ in self.named_parameters()} - initialized_params:
             raise RuntimeError(f"{missing} is not initialized")
 
     def _init_load_spec(self) -> None:
@@ -374,10 +415,34 @@ class BaseModel(nn.Module):
             return
 
         load_spec_mapping: dict[str, LoadSpec] = {}
+        hf_key_mapping_missing: set[str] = set()
 
         for name, param in self.state_dict().items():
             name = self._clean_param_name(name)
-            hf_keys = self.to_hf_key_list(name)
+            _hf_keys = self.to_hf_key_list(name)
+
+            if not self.config.hf_key_mapping:
+                hf_keys = _hf_keys
+            else:
+                hf_keys = []
+                for key in _hf_keys:
+                    max_matched_pattern = None
+                    max_match_len = -1
+                    for pattern in self.config.hf_key_mapping:
+                        if (matched := re.search(pattern, key)) is not None:
+                            matched_len = matched.end() - matched.start()
+
+                            if matched_len > max_match_len:
+                                max_match_len = matched_len
+                                max_matched_pattern = pattern
+
+                    if max_matched_pattern is None:
+                        hf_key_mapping_missing.add(key)
+                        hf_keys.append(key)
+                    else:
+                        repl = self.config.hf_key_mapping[max_matched_pattern]
+                        hf_keys.append(re.sub(max_matched_pattern, repl, key))
+
             if isinstance(param, DTensor) and (placement := get_shard_placement(param.placements)) is not None:
                 dim = placement.dim
                 _, _offset = compute_local_shape_and_global_offset(param.shape, param.device_mesh, param.placements)
@@ -455,6 +520,10 @@ class BaseModel(nn.Module):
                         load_enum=LoadEnum.FUSED,
                     )
             load_spec_mapping[name] = load_spec
+
+        if hf_key_mapping_missing:
+            logger.info("These hf keys will not be influenced by `hf_key_mapping`:")
+            logger.info(json.dumps(list(hf_key_mapping_missing), indent=2))
 
         self.load_spec_mapping = load_spec_mapping
 
@@ -762,11 +831,12 @@ class BaseModel(nn.Module):
         if buffer_tensor_list:
             yield buffer_name_list, buffer_tensor_list
 
+    # TODO: Using `xtuenr.v1.utils.misc.clean_param_name`
     def _clean_param_name(self, name: str) -> str:
-        if "._checkpoint_wrapped_module." in name:
-            name = name.replace("._checkpoint_wrapped_module.", ".")
-        if "._orig_mod." in name:
-            name = name.replace("._orig_mod.", ".")
+        if "_checkpoint_wrapped_module." in name:
+            name = name.replace("_checkpoint_wrapped_module.", "")
+        if "_orig_mod." in name:
+            name = name.replace("_orig_mod.", "")
         return name
 
     def _group_param_by_load_spec(self, load_enum: LoadEnum):
@@ -1433,3 +1503,30 @@ class BaseModel(nn.Module):
 
         for target, option in compile_cfg.items():
             self._compile_overwrite(target, option)
+
+    def _mark_dynamic(self, seq_ctx: SequenceContext, dim=0):
+        """`cu_seq_lens_q` and `cu_seq_lens_k` are dynamic shapes in each
+        fwd/bwd pass.
+
+        Mark them as dynamic explicitly to avoid recompilation.
+        """
+        torch._dynamo.mark_dynamic(seq_ctx.cu_seq_lens_q, dim)
+        torch._dynamo.mark_dynamic(seq_ctx.cu_seq_lens_k, dim)
+
+    def _init_world_mesh(self):
+        device = DEVICE
+        world_size = dist.get_world_size()
+
+        # TODO: Support hsdp_sharding_size
+        fsdp_mesh = init_device_mesh(device, (world_size,))
+        return fsdp_mesh
+
+    def _collect_full_state_dict(self, module: nn.Module):
+        assert isinstance(module, (nn.Module, FSDPModule))
+
+        ret = {}
+        for name, param in module.state_dict().items():  # type: ignore[attr-defined]
+            if isinstance(param, DTensor):
+                param = param.full_tensor()
+            ret[name] = param
+        return ret

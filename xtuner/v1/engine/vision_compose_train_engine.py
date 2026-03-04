@@ -67,23 +67,20 @@ class VisionComposeTrainEngine(TrainEngine):
                 scaling_granularity_grouped_gemm=self.model_cfg.projector_config.float8_cfg.scaling_granularity_grouped_gemm,
             )
 
-        model.language_model.fully_shard(self.fsdp_cfg, self.llm_float8_handler)
-        model.vision_tower.fully_shard(self.fsdp_cfg, self.vision_float8_handler)
-        model.multi_modal_projector.fully_shard(self.fsdp_cfg, self.projector_float8_handler)
         model = model.fully_shard(self.fsdp_cfg)
 
         if dist.get_rank() == 0:
             logger.info(model)
 
-        if self.llm_float8_handler:
+        if self.llm_float8_handler is not None:
             self.llm_float8_handler.build_reduce_mesh(
                 model.language_model, cast(DeviceMesh, model.language_model.fsdp_mesh)
             )
-        if self.vision_float8_handler:
+        if self.vision_float8_handler is not None:
             self.vision_float8_handler.build_reduce_mesh(
                 model.vision_tower, cast(DeviceMesh, model.vision_tower.fsdp_mesh)
             )
-        if self.projector_float8_handler:
+        if self.projector_float8_handler is not None:
             self.projector_float8_handler.build_reduce_mesh(
                 model.multi_modal_projector, cast(DeviceMesh, model.multi_modal_projector.fsdp_mesh)
             )
@@ -100,11 +97,13 @@ class VisionComposeTrainEngine(TrainEngine):
 
     # this method can be called outside, e.g., at the beginning of compute_actor_logprobs or compute_ref_logprobs during rl training
     def maybe_precompute_float8_dynamic_scale_for_fsdp(self):
-        if self.llm_float8_handler is not None and self.llm_float8_handler.enabled:
+        if self.llm_float8_handler is not None:
             self.llm_float8_handler.precompute_float8_dynamic_scale_for_fsdp(self.model.language_model)
-        if self.vision_float8_handler is not None and self.vision_float8_handler.enabled:
+
+        if self.vision_float8_handler:
             self.vision_float8_handler.precompute_float8_dynamic_scale_for_fsdp(self.model.vision_tower)
-        if self.projector_float8_handler is not None and self.projector_float8_handler.enabled:
+
+        if self.projector_float8_handler:
             self.projector_float8_handler.precompute_float8_dynamic_scale_for_fsdp(self.model.multi_modal_projector)
 
     def train_step(self, data_batches: List[ModelItem]) -> tuple[LossLog, OtherLog]:
@@ -167,8 +166,8 @@ class VisionComposeTrainEngine(TrainEngine):
                         step_consumed_img_tokens /= seq_ctx.sequence_parallel_mesh.size()
 
                 num_tokens = seq_ctx.cu_seq_lens_k[1:] - seq_ctx.cu_seq_lens_k[:-1]
-                efficient_forward_tokens += (num_tokens**2).sum()
-                total_forward_tokens += (num_tokens.sum()) ** 2
+                efficient_forward_tokens += (num_tokens.long() ** 2).sum()
+                total_forward_tokens += (num_tokens.long().sum()) ** 2
 
             # todo: support intra_layer_micro_batch
             output = self.model(seq_ctx=seq_ctx_list[0], loss_ctx=loss_ctx_list[0])
@@ -224,8 +223,20 @@ class VisionComposeTrainEngine(TrainEngine):
             reduced_z_loss = step_z_loss
             dist.all_reduce(reduced_z_loss.div_(dist.get_world_size()))
             loss_log["reduced_z_loss"] = reduced_z_loss.item()
-        other_log["step_consumed_tokens"] = cast(int, step_consumed_tokens.item())
+
+        other_log["step_consumed_tokens"] = int(step_consumed_tokens.item())
         other_log["extra_info"] = train_engine_extra_info  # type: ignore[assignment]
         other_log["efficient_attn_ratio"] = (efficient_forward_tokens / total_forward_tokens).item()
-        other_log["step_consumed_img_tokens"] = step_consumed_img_tokens
+        other_log["step_consumed_img_tokens"] = int(step_consumed_img_tokens)
+
+        extra_info = other_log.get("extra_info", {})  # type: ignore
+
+        # TODO: @duanyanhui `extra_info` should be redesigned.
+        if not isinstance(extra_info, ModelForwardExtraLogInfo):
+            extra_info = ModelForwardExtraLogInfo(extra_info)
+        loss_log.update(extra_info.get())
+
+        if "maxvio" in other_log:
+            loss_log["maxvio"] = other_log["maxvio"]  # type: ignore
+        loss_log["efficient_attn_ratio"] = other_log["efficient_attn_ratio"]  # type: ignore
         return loss_log, other_log

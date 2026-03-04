@@ -2,7 +2,7 @@
 import os
 import types
 from pathlib import Path
-from typing import Annotated, Literal, cast
+from typing import Annotated, Literal, Self, cast
 
 import torch
 import torch.distributed as dist
@@ -37,8 +37,11 @@ from xtuner.v1.model.base import (
 )
 from xtuner.v1.model.utils import ModelForwardExtraLogInfo, checkpoint_wrapper, module_dict_repr
 from xtuner.v1.module import (
+    GatedDeltaNetConfig,
     GreedyRouterConfig,
     LMHead,
+    MHAConfig,
+    MLAConfig,
     NoAuxRouter,
     NoAuxRouterConfig,
     RMSNorm,
@@ -116,6 +119,7 @@ class MoEConfig(TransformerConfig):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
     n_routed_experts: Annotated[int, Parameter(group="moe")]
     n_shared_experts: Annotated[int, Parameter(group="moe")]
+    with_shared_expert_gate: bool = False  # enable when n_shared_experts > 0
     num_experts_per_tok: Annotated[int, Parameter(group="moe")]
     first_k_dense_replace: Annotated[int, Parameter(group="moe")] = 0
     hidden_factor: Annotated[float, Parameter(group="moe")] = 1.0
@@ -166,7 +170,7 @@ class MoE(BaseModel):
         else:
             self.ep_mesh = None
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, type=config.rms_norm_type)
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, bias=False)
 
         self.layers = self.build_layers(config)
@@ -350,12 +354,17 @@ class MoE(BaseModel):
         cat_seq_ctx: SequenceContext | None = None
 
         moe_forward = False
+
+        for seq_ctx in seq_ctx_list:
+            self._mark_dynamic(seq_ctx)
+
         for idx, decoder_layer in self.layers.items():
             layer_idx = int(idx)
 
             if layer_idx < self.config.first_k_dense_replace:
                 if cat_seq_ctx is None:
                     cat_seq_ctx = SequenceContext.cat(seq_ctx_list)
+                    self._mark_dynamic(cat_seq_ctx)
                 # Dense decoder layer - process concated hidden states
                 cat_hidden_states = decoder_layer(
                     cat_hidden_states,
@@ -504,6 +513,8 @@ class MoE(BaseModel):
         output["router_logits"] = {}
         output["router_weights"] = {}
 
+        self._mark_dynamic(seq_ctx)
+
         for idx, decoder_layer in self.layers.items():
             if int(idx) < self.config.first_k_dense_replace:
                 hidden_states = decoder_layer(
@@ -585,7 +596,20 @@ class MoE(BaseModel):
         # 让 layers 是一个 nn.ModuleDict 方便做 pipeline parallel 的参数切分，
         # 这样可以保证部分 layer 被切掉后，idx 保持不变
         layers = nn.ModuleDict()
+        attention_config: GatedDeltaNetConfig | MLAConfig | MHAConfig | None = None
         for layer_idx in range(config.num_hidden_layers):
+            if config.layers_type[layer_idx] in ["full_attention", "sliding_attention"]:
+                attention_config = config.attention
+            elif config.layers_type[layer_idx] == "linear_attention":
+                attention_config = config.linear_attention
+                assert attention_config is not None, (
+                    "linear_attention config must be provided for linear_attention layer"
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported layer type {config.layers_type[layer_idx]} at layer {layer_idx}. Only 'full_attention', 'sliding_attention' and 'linear_attention' are supported."
+                )
+
             if layer_idx < config.first_k_dense_replace:
                 layers[str(layer_idx)] = DenseDecoderLayer(
                     hidden_size=config.hidden_size,
@@ -593,7 +617,8 @@ class MoE(BaseModel):
                     mlp_bias=config.mlp_bias,
                     hidden_act=config.hidden_act,
                     rms_norm_eps=config.rms_norm_eps,
-                    attention_config=config.attention,
+                    rms_norm_type=config.rms_norm_type,
+                    attention_config=attention_config,
                     layer_type=config.layers_type[layer_idx],
                     rope_scaling_cfg=config.rope_scaling_cfg,
                     generate_config=config.generate_config,
@@ -610,12 +635,14 @@ class MoE(BaseModel):
                     moe_bias=config.moe_bias,
                     hidden_act=config.hidden_act,
                     rms_norm_eps=config.rms_norm_eps,
+                    rms_norm_type=config.rms_norm_type,
                     num_experts_per_tok=config.num_experts_per_tok,
                     n_routed_experts=config.n_routed_experts,
                     n_shared_experts=config.n_shared_experts,
+                    with_shared_expert_gate=config.with_shared_expert_gate,
                     hidden_factor=config.hidden_factor,
                     layer_type=config.layers_type[layer_idx],
-                    attention_config=config.attention,
+                    attention_config=attention_config,
                     rope_scaling_cfg=config.rope_scaling_cfg,
                     generate_config=config.generate_config,
                     router_config=config.router,
@@ -657,8 +684,7 @@ class MoE(BaseModel):
     def fully_shard(
         self,
         fsdp_config: FSDPConfig,
-        float8_handler: Float8Handler | None = None,
-    ) -> "MoE":
+    ) -> Self:
         self.fsdp_config = fsdp_config
         assert self.fsdp_config.ep_size == self.config.ep_size
         self.mp_policy = MixedPrecisionPolicy(
@@ -666,12 +692,10 @@ class MoE(BaseModel):
         )
         self._init_device_mesh(fsdp_config)
 
-        if float8_handler is not None:
+        if self.config.float8_cfg is not None:
             # As we modify the shape of the model's parameters,
             # we need to reinitialize the load spec mapping.
-            float8_handler.pad_for_fsdp(
-                self, cast(DeviceMesh, self.fsdp_mesh), callback_after_pad=self._init_load_spec
-            )
+            Float8Handler.pad_for_fsdp(self, cast(DeviceMesh, self.fsdp_mesh), callback_after_pad=self._init_load_spec)
 
         # Just for narrowing the type of self.fsdp_mesh and self.ep_mesh
         assert self.fsdp_mesh is not None

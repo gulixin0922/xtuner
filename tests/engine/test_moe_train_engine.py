@@ -14,7 +14,7 @@ from collections import defaultdict
 
 from xtuner.v1.model.moe.moe import SequenceContext
 from xtuner.v1.model.base import ModelItem
-from xtuner.v1.loss.ce_loss import CELossConfig, CELossContextInputItem
+from xtuner.v1.loss.ce_loss import CELossConfig
 from xtuner.v1.model.moe.qwen3 import Qwen3MoE30BA3Config, Qwen3MoEConfig
 from xtuner.v1.config import FSDPConfig, LRConfig, AdamWConfig
 from xtuner.v1.model.moe.moe import BalancingLossConfig, ZLossConfig
@@ -48,11 +48,11 @@ class TestMoEEngine(DeterministicDDPTestCase):
             ep_size=ep_size,
             balancing_loss_cfg=BalancingLossConfig(),
             z_loss_cfg=ZLossConfig(),
+            compile_cfg=False,
         )
         optim_cfg: AdamWConfig = AdamWConfig()
         lr_cfg: LRConfig = LRConfig()
         fsdp_cfg: FSDPConfig = FSDPConfig(
-            torch_compile=False,
             cpu_offload=False,
             ep_size=ep_size,
             # hsdp_sharding_size=hsdp_sharding_size,
@@ -92,14 +92,11 @@ class TestMoEEngine(DeterministicDDPTestCase):
             labels = labels.to(DEVICE)
             seq_ctx.num_padding = pack_len
             seq_ctx_list = [seq_ctx]
-            loss_ctx_input_list: list[CELossContextInputItem] = [CELossContextInputItem(shifted_labels=labels)]
             LossContext = loss_cfg.loss_ctx_cls
-            batches_loss_kwargs = LossContext.build_batches_loss_kwargs(
-                loss_ctx_input_list, 
-                loss_cfg,
-            )
-            loss_kwargs = batches_loss_kwargs[0]
-            loss_ctx = LossContext(loss_cfg, loss_kwargs)
+            loss_ctx = loss_cfg.build(shifted_labels=labels, sp_mesh=None)
+            loss_ctx_list = [loss_ctx]
+            loss_ctx_list = LossContext.build_batches(loss_ctx_list)
+            loss_ctx = loss_ctx_list[0]
             seq_ctx = seq_ctx_list[0]
             engine_input = [ModelItem(seq_ctx=seq_ctx, loss_ctx=loss_ctx)]
             loss_log, _ = engine.train_step(engine_input)
@@ -132,11 +129,11 @@ class TestMoEEngine(DeterministicDDPTestCase):
             balancing_loss_cfg=BalancingLossConfig(),
             z_loss_cfg=ZLossConfig(),
             freeze_routers=True,
+            compile_cfg=False,
         )
         optim_cfg: AdamWConfig = AdamWConfig()
         lr_cfg: LRConfig = LRConfig()
         fsdp_cfg: FSDPConfig = FSDPConfig(
-            torch_compile=False,
             cpu_offload=False,
             ep_size=ep_size,
             # hsdp_sharding_size=hsdp_sharding_size,
@@ -186,14 +183,11 @@ class TestMoEEngine(DeterministicDDPTestCase):
             labels = labels.to(DEVICE)
             seq_ctx.num_padding = pack_len
             seq_ctx_list = [seq_ctx]
-            loss_ctx_input_list: list[CELossContextInputItem] = [CELossContextInputItem(shifted_labels=labels)]
             LossContext = loss_cfg.loss_ctx_cls
-            batches_loss_kwargs = LossContext.build_batches_loss_kwargs(
-                loss_ctx_input_list, 
-                loss_cfg,
-            )
-            loss_kwargs = batches_loss_kwargs[0]
-            loss_ctx = LossContext(loss_cfg, loss_kwargs)
+            loss_ctx = loss_cfg.build(shifted_labels=labels, sp_mesh=None)
+            loss_ctx_list = [loss_ctx]
+            loss_ctx_list = LossContext.build_batches(loss_ctx_list)
+            loss_ctx = loss_ctx_list[0]
             seq_ctx = seq_ctx_list[0]
             engine_input = [ModelItem(seq_ctx=seq_ctx, loss_ctx=loss_ctx)]
             loss_log, _ = engine.train_step(engine_input)
@@ -238,10 +232,10 @@ class TestMoEEngine(DeterministicDDPTestCase):
             ep_size=ep_size,
             balancing_loss_cfg=BalancingLossConfig(),
             z_loss_cfg=ZLossConfig(),
+            compile_cfg=False,
         )
         optim_cfg: AdamWConfig = AdamWConfig()
         fsdp_cfg: FSDPConfig = FSDPConfig(
-            torch_compile=False,
             cpu_offload=False,
             ep_size=ep_size,
             hsdp_sharding_size=hsdp_sharding_size,
@@ -453,12 +447,12 @@ def create_engine_from_hf(load_from: Path, dispatcher: str | None, ep_size: int,
     moe_cfg : Qwen3MoEConfig = get_model_config_from_hf(load_from)
     moe_cfg.dispatcher = dispatcher
     moe_cfg.ep_size = ep_size
+    moe_cfg.compile_cfg = False
     if tiny:
         moe_cfg.num_hidden_layers = 2
 
     optim_cfg: AdamWConfig = AdamWConfig()
     fsdp_cfg: FSDPConfig = FSDPConfig(
-        torch_compile=False,
         cpu_offload=False,
         ep_size=ep_size,
     )
