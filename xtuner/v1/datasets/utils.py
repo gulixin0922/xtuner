@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
 import numpy as np
 import xxhash
 from PIL import Image
-from typing_extensions import TypedDict
 
 from .data_item import CacheItem
 
@@ -20,13 +19,11 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
 
 
-class CacheObj(TypedDict, total=False):
-    num_tokens: int
-
-
 class CachableTokenizeFunction(ABC, Generic[T]):
-    def __init__(self, tokenizer, *args, **kwargs):
+    def __init__(self, tokenizer, *args, llm_pack_weight: float = 1.0, visual_pack_weight: float = 0.0, **kwargs):
         self.tokenizer = tokenizer
+        self.llm_pack_weight = llm_pack_weight
+        self.visual_pack_weight = visual_pack_weight
         self.state = "runtime"
 
     @abstractmethod
@@ -39,6 +36,13 @@ class CachableTokenizeFunction(ABC, Generic[T]):
 
     def set_state(self, state: Literal["cache", "runtime"]):
         self.state = state
+
+    def proxy_attention_flops(
+        self, num_tokens: int, num_img_tokens: list[int], flash_attn_block_size: int = 128
+    ) -> float:
+        llm_num_patch = (round(num_tokens / flash_attn_block_size)) ** 2
+        img_num_patch = sum((n / flash_attn_block_size) ** 2 for n in num_img_tokens)
+        return self.llm_pack_weight * llm_num_patch + self.visual_pack_weight * img_num_patch
 
 
 def calculate_file_sha256(path):

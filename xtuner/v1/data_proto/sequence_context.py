@@ -45,7 +45,7 @@ class SequenceContext:
     # mllm model
     pixel_values: torch.FloatTensor | None
     inputs_embeds: torch.FloatTensor | None
-    num_img_tokens: list[int] | None
+    num_img_tokens: list[list[int]] | None
 
     # moe routed_experts
     rollout_routed_experts: torch.Tensor | None
@@ -69,7 +69,7 @@ class SequenceContext:
         # mllm model
         pixel_values: torch.FloatTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
-        num_img_tokens: list[int] | None = None,
+        num_img_tokens: list[list[int]] | None = None,
         rollout_routed_experts: torch.Tensor | None = None,
     ):
         # Only to distinguish parameters accepted by the constructor from attributes. For example, for `max_length_q`,
@@ -285,7 +285,17 @@ class SequenceContext:
             mask = cast(torch.BoolTensor, torch.ones_like(self.input_ids, dtype=torch.bool))
         else:
             assert self.inputs_embeds is not None, "input_ids or inputs_embeds must be provided"
-            mask = cast(torch.BoolTensor, torch.ones_like(self.inputs_embeds[..., 0], dtype=torch.bool))
+            # NOTE:
+            # In some distributed / optimization settings, inputs_embeds can be a tensor
+            # whose .storage() has size 0 (fake / sharded view), which breaks operations
+            # like torch.ones_like that rely on the underlying storage layout.
+            # Here we only care about the (batch, seq_len) shape, so construct the mask
+            # directly from the logical shape instead of using ones_like on the tensor.
+            seq_shape = self.inputs_embeds.shape[:-1]
+            mask = cast(
+                torch.BoolTensor,
+                torch.ones(seq_shape, dtype=torch.bool, device=self.inputs_embeds.device),
+            )
         if self.num_padding > 0:
             mask[..., -self.num_padding :] = False
         return mask
