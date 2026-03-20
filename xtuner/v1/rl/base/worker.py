@@ -26,7 +26,7 @@ from xtuner.v1.datasets.config import DataloaderConfig
 from xtuner.v1.datasets.dataloader import Dataloader
 from xtuner.v1.engine.train_engine import TrainEngine, TrainStepInfo
 from xtuner.v1.float8.float8_handler import Float8Handler
-from xtuner.v1.loss import CELossConfig
+from xtuner.v1.loss import CELossConfig, LogProbConfig
 from xtuner.v1.loss.ce_loss import CELossContext
 from xtuner.v1.model.base import BaseModel as XtunerBaseModel
 from xtuner.v1.model.base import ModelItem, TransformerConfig
@@ -248,6 +248,11 @@ class TrainingWorker(SingleAcceleratorWorker):
         self.rollout_cfg_info: dict = dict()
         self.endpoints: dict[str, str] = dict()
         self.endpoints["update_weights"] = "update_weights"
+        if worker_cfg.loss_cfg.chunk_size is not None:
+            mode = "chunk"
+        else:
+            mode = "eager"
+        self.logprob_cfg = LogProbConfig(chunk_size=worker_cfg.loss_cfg.chunk_size, mode=mode)
 
     def _init_sft(self, worker_cfg: WorkerConfig):
         self._sft_dataloader_config = worker_cfg.sft_dataloader_cfg
@@ -294,7 +299,6 @@ class TrainingWorker(SingleAcceleratorWorker):
             fsdp_cfg=worker_cfg.fsdp_cfg,
             model_cfg=worker_cfg.model_cfg,
         )
-
         if worker_cfg.load_from is not None:
             engine.from_hf(worker_cfg.load_from)
 
@@ -373,9 +377,9 @@ class TrainingWorker(SingleAcceleratorWorker):
         self._engine._maybe_precompute_float8_dynamic_scale_for_fsdp()
         old_logprobs_list: list[torch.Tensor] = []
         for seq_ctx, shifted_labels in zip(seq_ctx_list, shifted_labels_list):
-            output = self._engine.forward_only(seq_ctx=seq_ctx)
-            old_logprobs = gather_logprobs(output["logits"], shifted_labels)
-            old_logprobs_list.append(old_logprobs)
+            loss_ctx = self.logprob_cfg.build(shifted_labels=shifted_labels)
+            output = self._engine.forward_only(seq_ctx=seq_ctx, loss_ctx=loss_ctx)
+            old_logprobs_list.append(output["loss"])
         return old_logprobs_list
 
     def compute_ref_logprobs(
@@ -422,7 +426,7 @@ class TrainingWorker(SingleAcceleratorWorker):
                     rollout_routed_expert = ray.get(rollout_routed_expert_refs)
                     # free obj store explicitly
                     if self.sp_mesh is None or self.sp_mesh.size() == 1:
-                        ray._private.internal_api.free(rollout_routed_expert_refs)
+                        ray.internal.free(rollout_routed_expert_refs, local_only=False)
                     else:
                         if self.sp_mesh.get_local_rank() == 0:
                             # only free once of sp mesh
@@ -451,7 +455,7 @@ class TrainingWorker(SingleAcceleratorWorker):
         if self.sp_mesh is not None and self.sp_mesh.size() > 1:
             dist.barrier()
             for free_routed_expert_refs in to_free_routed_expert_refs:
-                ray._private.internal_api.free(free_routed_expert_refs)
+                ray.internal.free(free_routed_expert_refs, local_only=False)
             del to_free_routed_expert_refs
 
     @ray_method

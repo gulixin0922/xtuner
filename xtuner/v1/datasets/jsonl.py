@@ -1,11 +1,14 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import atexit
 import datetime
+import hashlib
 import itertools
 import json
 import math
 import multiprocessing
 import os
 import random
+import shutil
 import time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -14,11 +17,9 @@ from io import BytesIO
 from multiprocessing import Process, Queue
 from pathlib import Path
 from threading import Lock
-from typing import Callable, Dict, List, TypeVar, Union, cast
+from typing import Callable, Dict, TypeVar, cast
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
 import torch
 from mmengine import mkdir_or_exist
 from mmengine.dist import barrier, get_rank
@@ -27,7 +28,9 @@ from tqdm import tqdm
 
 from xtuner.v1.datasets.data_item import CacheItem
 from xtuner.v1.datasets.pt_tokenize_fn.long_text import LongTextPretrainTokenizeFunction
+from xtuner.v1.datasets.rl_tokenize_fn.rl_tokenize_fn import RLTokenizeFn
 from xtuner.v1.utils import SharedMemory, get_logger
+from xtuner.v1.utils.device import get_torch_device_module
 
 from .utils import CachableTokenizeFunction, calculate_xxhash
 
@@ -35,7 +38,7 @@ from .utils import CachableTokenizeFunction, calculate_xxhash
 T = TypeVar("T")
 logger = get_logger()
 _lock = Lock()
-
+DEVICE_MODULE = get_torch_device_module()
 
 CACHE_META = ".xpuyu-cache-meta.json"
 XTUNER_FILE_OPEN_CONCURRENCY = int(os.environ.get("XTUNER_FILE_OPEN_CONCURRENCY", "8"))
@@ -49,75 +52,81 @@ def _concat_values(values):
     return list(itertools.chain.from_iterable(values))
 
 
-def save_mixed_dict_to_parquet(
-    data: Dict[str, Union[np.ndarray, List[List[int] | List[float]]]], file_path: str
-) -> None:
-    """通用保存函数：将 dict[str, np.array | list[list[int|float]]] 保存为 Parquet 文件.
-
-    每个 value 整体存为单行单 cell，避免不同 key 长度不一致导致 Arrow 报错。 通过 schema metadata 记录原始类型（np / list），确保 load 时正确还原。
-
-    :param data: 混合类型字典（键为字符串，值为 np.array 或 list[list[int|float]]）
-    :param file_path: 保存路径（如 "data.parquet"）
-    """
-    if not isinstance(data, dict):
-        raise ValueError("输入必须是字典类型")
-
-    type_map: Dict[str, str] = {}
-    fields = []
-    arrays = []
-    for key, value in data.items():
-        if isinstance(value, np.ndarray):
-            py_val = value.tolist()
-            type_map[key] = "np"
-        elif isinstance(value, list):
-            py_val = value
-            type_map[key] = "list"
-        else:
-            raise TypeError(f"不支持的数据类型: {type(value)}，仅支持 np.ndarray 或 list[list[int|float]]")
-
-        pa_arr = pa.array([py_val])
-        fields.append(pa.field(key, pa_arr.type))
-        arrays.append(pa_arr)
-
-    schema = pa.schema(fields, metadata={b"__type_map__": json.dumps(type_map).encode()})
-    table = pa.Table.from_arrays(arrays, schema=schema)
-    pq.write_table(table, file_path)
-    print(f"数据已成功保存到: {file_path}")
+def save_dict_to_npy_dir(data: Dict[str, np.ndarray], dir_path: str) -> None:
+    """将 dict 以每 key 一个 .npy 文件的形式保存到目录."""
+    os.makedirs(dir_path, exist_ok=True)
+    for k, v in data.items():
+        if not isinstance(k, str):
+            raise TypeError(f"key must be str, got {type(k)}")
+        if not isinstance(v, np.ndarray):
+            raise TypeError(f"value for key '{k}' must be np.ndarray, got {type(v)}")
+        np.save(os.path.join(dir_path, f"{k}.npy"), v)
 
 
-def load_mixed_dict_from_parquet(file_path: str) -> Dict[str, Union[np.ndarray, List[List[int] | List[float]]]]:
-    """通用恢复函数：从 Parquet 文件恢复 dict[str, np.array | list[list[int|float]]].
-
-    :param file_path: Parquet 文件路径
-    :return: 与保存时一致的混合类型字典
-    """
-    table = pq.read_table(file_path)
-
-    metadata = table.schema.metadata or {}
-    type_map_raw = metadata.get(b"__type_map__")
-    type_map: Dict[str, str] = json.loads(type_map_raw) if type_map_raw else {}
-
-    result: Dict[str, Union[np.ndarray, List[List[int] | List[float]]]] = {}
-    for col_name in table.column_names:
-        col = table.column(col_name)
-        pylist = col.to_pylist()
-
-        # 新格式：每列只有 1 行，cell 内是完整的值
-        if len(table) == 1:
-            val = pylist[0]
-        else:
-            val = pylist
-
-        orig_type = type_map.get(col_name)
-        if orig_type == "list":
-            result[col_name] = val
-        else:
-            try:
-                result[col_name] = np.array(val)
-            except (ValueError, TypeError):
-                result[col_name] = val
-
+def load_dict_from_npy_dir(dir_path: str, mmap: bool = True) -> Dict[str, np.ndarray]:
+    """从 npy 目录按 key 加载 _meta；object 数组完整加载，其余 mmap_mode='r'."""
+    if not os.path.exists(dir_path):
+        return {}
+    result = {}
+    for fname in os.listdir(dir_path):
+        if not fname.endswith(".npy"):
+            continue
+        key = fname[:-4]
+        fpath = os.path.join(dir_path, fname)
+        arr = np.load(fpath, mmap_mode="r" if mmap else None)
+        result[key] = arr
     return result
+
+
+def _filter_sampled_indices(
+    sampled: np.ndarray,
+    num_tokens: np.ndarray | None,
+    max_length: int | None,
+) -> np.ndarray:
+    # Filter out samples with num_tokens=0, 0 means the sample is damaged
+    if num_tokens is not None:
+        assert isinstance(num_tokens, np.ndarray)
+        orig_sample_num = len(num_tokens)
+        sampled = sampled[num_tokens[sampled] != 0]
+        if len(sampled) < orig_sample_num:
+            missed = orig_sample_num - len(sampled)
+            logger.warning(f"filtered {missed} damaged samples (num_tokens==0).")
+
+    if num_tokens is not None and max_length is not None:
+        assert isinstance(max_length, int)
+        before = len(sampled)
+        sampled = sampled[num_tokens[sampled] <= max_length]
+        if len(sampled) < before:
+            logger.warning(f"filtered {before - len(sampled)} samples with length>{max_length}.")
+
+    return sampled
+
+
+def _apply_sample_ratio(
+    sampled: np.ndarray,
+    *,
+    sample_ratio: float,
+    enable_sequential_sampler: bool,
+) -> np.ndarray:
+    target = int(len(sampled) * sample_ratio)
+    if target <= 0:
+        return sampled[:0]
+
+    base_repeats = int(sample_ratio)
+    repeated = np.tile(sampled, base_repeats) if base_repeats > 0 else sampled[:0]
+    remaining = target - len(repeated)
+    if remaining <= 0:
+        return repeated[:target]
+
+    if enable_sequential_sampler:
+        extra = sampled[:remaining]
+    else:
+        # Keep the same no-replacement behavior as `random.sample`,
+        # but avoid converting the whole numpy array to Python list.
+        choice_idxs = random.sample(range(len(sampled)), remaining)
+        extra = sampled[np.asarray(choice_idxs, dtype=np.int64)]
+
+    return np.concatenate([repeated, extra], axis=0)
 
 
 def _streaming_parallel_open_inplace(path: str, buf, executor: ThreadPoolExecutor):
@@ -201,10 +210,21 @@ def chunk_data_to_queue(
 def _get_local_concurrency():
     """Get the local concurrency level based on the environment variable."""
     if dist.is_initialized():
-        local_rank_concurrency = os.getenv("LOCAL_WORLD_SIZE", "1")
+        local_rank_concurrency = os.getenv("LOCAL_WORLD_SIZE")
+        if local_rank_concurrency is None:
+            local_rank_concurrency = os.getenv("PROC_PER_NODE")
+        if local_rank_concurrency is None:
+            local_rank_concurrency = DEVICE_MODULE.device_count()
     else:
         local_rank_concurrency = 1
     return int(local_rank_concurrency)
+
+
+def _is_local_rank0() -> bool:
+    """Return True if this process is local rank 0."""
+    if not dist.is_initialized():
+        return True
+    return dist.get_rank() % _get_local_concurrency() == 0
 
 
 # NOTE: The `map` or `submit` function of `concurrent.futures.ProcessPoolExecutor` will cause frequent serialization
@@ -258,6 +278,9 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
     _thread_executor: ThreadPoolExecutor | None = None
     # TODO: Using shared memory should be optional since the size of `/dev/shm` could be not enough for some devices
     _shared_memory: SharedMemory | None = None
+    offsets: np.ndarray
+    num_tokens: np.ndarray | None
+    _meta: dict[str, np.ndarray]
 
     def __init__(
         self,
@@ -269,6 +292,7 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
         max_length: int | None = None,  # TODO: Remove max_length in dataset
         cache_tag: str | None = None,
         enable_sequential_sampler: bool = False,
+        enable_mmap_shared: bool = False,
     ):
         super().__init__()
 
@@ -284,18 +308,14 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
 
         self._has_chunk = isinstance(tokenize_fn, LongTextPretrainTokenizeFunction)
 
-        self._proxy_attention_flops_fn = None
-        if tokenize_fn is not None:
-            self._proxy_attention_flops_fn = tokenize_fn.proxy_attention_flops
-
         tok_cache_dir: str | None = None  # set inside cache_dir branch when tokenize_fn is CachableTokenizeFunction
         if cache_tag is not None and (cached := self._get_cached_tag(cache_tag, tokenize_fn)) is not None:
             logger.info(f"[Dataset] Load cached [{self.name}]{self.path} of cache tgs {cache_tag}.")
             offset_path = cached["offsets"]
             meta_path = cached.get("jsonl_meta")
-            offsets = np.load(offset_path)
+            offsets = np.load(offset_path, mmap_mode="r" if enable_mmap_shared else None)
             if meta_path:
-                _meta = load_mixed_dict_from_parquet(meta_path)
+                _meta = load_dict_from_npy_dir(meta_path, mmap=enable_mmap_shared)
                 num_tokens = _meta["num_tokens"]
         elif cache_dir:
             self._shared_memory = self._init_shared_memory(anno_path)
@@ -343,7 +363,7 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
                 #         "<tag name>": {
                 #             "<file path>": {
                 #                 "<tokenize hash>": {
-                #                     "jsonl_meta": "<tokenize cache path>/jsonl_meta.parquet",
+                #                     "jsonl_meta": "<tokenize cache path>/jsonl_meta/",
                 #                     "offsets": "<file cache path>",
                 #                     "datetime": "2025-06-30 09:40:24"
                 #                 }
@@ -365,7 +385,7 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
 
             barrier()
 
-            offsets = np.load(_cached_file)
+            offsets = np.load(_cached_file, mmap_mode="r" if enable_mmap_shared else None)
 
             if tokenize_fn and isinstance(tokenize_fn, CachableTokenizeFunction):
                 tok_hash = tokenize_fn.hash()
@@ -375,15 +395,14 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
                         mkdir_or_exist(tok_cache_dir)
                 barrier()
 
-                _meta_file = os.path.join(tok_cache_dir, "jsonl_meta.parquet")
+                _meta_file = os.path.join(tok_cache_dir, "jsonl_meta")
                 if os.path.exists(_meta_file):
                     logger.info(f"Loading tokenize meta from cache: {_meta_file}")
-                    _meta = load_mixed_dict_from_parquet(_meta_file)
+                    _meta = load_dict_from_npy_dir(_meta_file, mmap=enable_mmap_shared)
                     num_tokens = _meta["num_tokens"]
                 else:
-                    serialized_tokenized_global = self.count_tokens(offsets, tok_cache_dir)
-                    num_tokens = serialized_tokenized_global["num_tokens"]
-                    _meta = serialized_tokenized_global
+                    _meta = self.count_tokens(offsets, tok_cache_dir)
+                    num_tokens = _meta["num_tokens"]
 
                 if get_rank() == 0:
                     with open(self.meta_path, "r+") as f:
@@ -410,7 +429,7 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
 
                             if tok_hash not in tag_data[self.path]:
                                 tag_data[self.path][tok_hash] = {
-                                    "jsonl_meta": os.path.join(tok_cache_dir, "jsonl_meta.parquet"),
+                                    "jsonl_meta": os.path.join(tok_cache_dir, "jsonl_meta"),
                                     "offsets": os.path.join(file_cache_dir, "offsets.npy"),
                                     "datetime": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                 }
@@ -426,9 +445,8 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
                     "`CachableTokenizeFunction`, data will always "
                     "be re-tokenized during training!"
                 )
-                serialized_tokenized_global = self.count_tokens(offsets)
-                num_tokens = serialized_tokenized_global["num_tokens"]
-                _meta = serialized_tokenized_global
+                _meta = self.count_tokens(offsets)
+                num_tokens = _meta["num_tokens"]
             else:
                 offsets = offsets
                 num_tokens = None
@@ -439,82 +457,107 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
             num_tokens = None
             _meta = {}
             if tokenize_fn is not None:
-                serialized_tokenized_global = self.count_tokens(offsets)
-                num_tokens = serialized_tokenized_global["num_tokens"]
-                _meta = serialized_tokenized_global
+                _meta = self.count_tokens(offsets)
+                num_tokens = _meta["num_tokens"]
 
-        if self._has_chunk:
-            line_idxs = _meta["line_idxs"]
-            offsets = offsets[line_idxs]
-            # After line_idxs indexing, offsets has exactly num_chunks elements
-            # (no trailing sentinel), so use len(offsets) directly.
-            _sampled = list(range(len(offsets)))
-        else:
-            # offset starts from 0 and ends with `file_size`
-            # The size of offsets is `num_samples + 1`
-            _sampled = list(range(len(offsets) - 1))
-        # Filter out samples with num_tokens=0, 0 means the sample is damaged
-        if num_tokens is not None:
-            orig_sample_num = len(num_tokens)
-            _sampled = [i for i in _sampled if num_tokens[i] != 0]
-            if len(_sampled) < orig_sample_num:
-                logger.warning(f"{self.path} has {orig_sample_num - len(_sampled)} damaged samples, discard.")
+        # remove num_tokens from _meta, because variable `num_tokens` is already set
+        _meta.pop("num_tokens", None)
 
-        # Skip max_length filter when chunks exist: long docs are already split into chunks,
-        # so filtering by total doc length would incorrectly discard valid long-text samples.
-        if num_tokens is not None and max_length is not None and not self._has_chunk:
-            assert isinstance(max_length, int)
-            assert isinstance(num_tokens, np.ndarray)
-            _filtered = [i for i in _sampled if num_tokens[i] <= max_length]
+        tok_hash_str = ""
+        if isinstance(
+            tokenize_fn, RLTokenizeFn
+        ):  # RLTokenizeFn is CachableTokenizeFunction, but it does not have a hash method
+            tok_hash_str = "RLTokenizeFn"
+        elif isinstance(tokenize_fn, CachableTokenizeFunction):
+            tok_hash_str = tokenize_fn.hash()
 
-            if len(_filtered) < len(_sampled):
-                missed_num = len(_sampled) - len(_filtered)
-                logger.warning(f"{self.path} has {missed_num} prompt length>{max_length}, discard.")
+        job_discriminator = os.environ.get("MASTER_PORT", "")
+        tmp_dir = os.path.join(
+            "/tmp",
+            hashlib.md5(
+                f"jsonl_mmap_{self.path}_{sample_ratio}_{max_length}_{tok_hash_str}_{job_discriminator}".encode()
+            ).hexdigest(),
+        )
 
-            _sampled = _filtered
-
-        _target_num_samples = int(len(_sampled) * sample_ratio)
-        self.sampled = _sampled * int(sample_ratio)
-        if enable_sequential_sampler:
-            self.sampled.extend(_sampled[: _target_num_samples - len(self.sampled)])
-        else:
-            self.sampled.extend(random.sample(_sampled, _target_num_samples - len(self.sampled)))
-
-        if num_tokens is not None:
-            assert isinstance(num_tokens, np.ndarray)
-            num_tokens = num_tokens[self.sampled]
-        self.num_tokens: np.ndarray | None = num_tokens
-        self.offsets = offsets[self.sampled]
-
-        # check all values in _meta are same length
-        v_len = None
-        for _, v in _meta.items():
-            if v_len is None:
-                v_len = len(v)
+        if enable_mmap_shared and dist.is_initialized() and _get_local_concurrency() > 1:
+            # Only local rank0 computes sampling and saves to tmp; others mmap-load to share physical pages.
+            if _is_local_rank0():
+                self._set_meta_attrs(
+                    offsets,
+                    num_tokens,
+                    _meta,
+                    sample_ratio=sample_ratio,
+                    max_length=max_length,
+                    enable_sequential_sampler=enable_sequential_sampler,
+                )
+                os.makedirs(tmp_dir, exist_ok=True)
+                np.save(os.path.join(tmp_dir, "offsets.npy"), self.offsets)
+                if self.num_tokens is not None:
+                    np.save(os.path.join(tmp_dir, "num_tokens.npy"), self.num_tokens)
+                save_dict_to_npy_dir(self._meta, os.path.join(tmp_dir, "meta"))
+                atexit.register(shutil.rmtree, tmp_dir, True)
             else:
-                assert len(v) == v_len
-
-        self._meta = {}
-        for k, v in _meta.items():
-            if isinstance(v, np.ndarray):
-                self._meta[k] = v[self.sampled]
-            elif isinstance(v, list):
-                self._meta[k] = [v[i] for i in self.sampled]
-            else:
-                raise ValueError(f"Unsupported type: {type(v)}")
+                del _meta, offsets
+                if num_tokens is not None:
+                    del num_tokens
+            dist.barrier()
+            self.offsets = np.load(os.path.join(tmp_dir, "offsets.npy"), mmap_mode="r")
+            nt_path = os.path.join(tmp_dir, "num_tokens.npy")
+            self.num_tokens = np.load(nt_path, mmap_mode="r") if os.path.exists(nt_path) else None
+            self._meta = load_dict_from_npy_dir(os.path.join(tmp_dir, "meta"), mmap=True)
+        else:
+            self._set_meta_attrs(
+                offsets,
+                num_tokens,
+                _meta,
+                sample_ratio=sample_ratio,
+                max_length=max_length,
+                enable_sequential_sampler=enable_sequential_sampler,
+            )
 
         if self._shared_memory is not None:
             self._release_shared_memory()
 
-        # calc the proxy attention flops
-        _total_proxy_attn_flops = []
-        for i in range(len(self.sampled)):
-            assert self.num_tokens is not None, "num_tokens must be calculated to compute proxy attention flops."
-            _num_tokens = self.num_tokens[i]
-            _num_image_tokens = self._meta["num_img_tokens"][i]
-            if self._proxy_attention_flops_fn is not None:
-                _total_proxy_attn_flops.append(self._proxy_attention_flops_fn(_num_tokens, _num_image_tokens))
-        self._meta["proxy_attn_flops"] = np.array(_total_proxy_attn_flops)
+    def _set_meta_attrs(
+        self,
+        offsets: np.ndarray,
+        num_tokens: np.ndarray | None,
+        _meta: dict,
+        *,
+        sample_ratio: float,
+        max_length: int | None,
+        enable_sequential_sampler: bool,
+    ) -> None:
+        """Compute sampling and set self.offsets, self.num_tokens,
+        self._meta."""
+        if self._has_chunk:
+            line_idxs = _meta.pop("line_idxs")
+            offsets = offsets[line_idxs]
+            # After line_idxs indexing, offsets has exactly num_chunks elements
+            # (no trailing sentinel), so use len(offsets) directly.
+            base_len = len(offsets)
+        else:
+            # offsets has trailing sentinel (file_size), so samples are num_offsets - 1
+            base_len = len(offsets) - 1
+        dtype = np.int32 if base_len < np.iinfo(np.int32).max else np.int64
+        _sampled = np.arange(base_len, dtype=dtype)
+        _sampled = _filter_sampled_indices(_sampled, num_tokens, max_length)
+        sampled = _apply_sample_ratio(
+            _sampled,
+            sample_ratio=sample_ratio,
+            enable_sequential_sampler=enable_sequential_sampler,
+        )
+        if num_tokens is not None:
+            assert isinstance(num_tokens, np.ndarray)
+            num_tokens = num_tokens[sampled]
+        self.num_tokens = num_tokens
+        self.offsets = offsets[sampled]
+        for _, v in _meta.items():
+            assert base_len == len(v)
+        self._meta = {}
+        for k, v in _meta.items():
+            assert isinstance(v, np.ndarray)
+            self._meta[k] = v[sampled]
 
     @property
     def proxy_attn_flops(self) -> np.ndarray:
@@ -581,11 +624,9 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
     ) -> dict:
         line = data.decode()
         tokenized: dict = tokenize_fn(json.loads(line))  # type: ignore[assignment]
-        res = {"num_tokens": tokenized["num_tokens"]}
+        res = {"num_tokens": tokenized["num_tokens"], "proxy_attn_flops": tokenized["proxy_attn_flops"]}
         if "chunks" in tokenized:
             res["chunks"] = tokenized["chunks"]
-        if "num_img_tokens" in tokenized:
-            res["num_img_tokens"] = tokenized["num_img_tokens"]
         return res
 
     def count_tokens(self, offsets, cache_dir=None):
@@ -635,35 +676,27 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
         # serialize tokenized
         if self._has_chunk:
             num_tokens_of_chunks = []
-            num_img_tokens_of_chunks = []
+            proxy_attn_flops_list = []
             chunks_of_chunks = []
             line_idxs_of_chunks = []
             for line_idx, data in enumerate(tokenized):
                 num_tokens_of_chunks.extend(data["num_tokens"])
-                num_img_tokens_of_chunks.extend(data.get("num_img_tokens", [[0]] * len(data["num_tokens"])))
+                proxy_attn_flops_list.extend(data["proxy_attn_flops"])
                 chunks_of_chunks.extend(
                     [(c["char_start"], c["char_end"], c["token_start_offset"]) for c in data["chunks"]]
                 )
                 line_idxs_of_chunks.extend([line_idx] * len(data["num_tokens"]))
             serialized_tokenized = {
                 "num_tokens": np.array(num_tokens_of_chunks),
-                "num_img_tokens": num_img_tokens_of_chunks,
+                "proxy_attn_flops": np.array(proxy_attn_flops_list),
                 "chunks": np.array(chunks_of_chunks),
                 "line_idxs": np.array(line_idxs_of_chunks),
             }
         else:
             serialized_tokenized = {
                 "num_tokens": np.array([data["num_tokens"] for data in tokenized]),
+                "proxy_attn_flops": np.array([data["proxy_attn_flops"] for data in tokenized]),
             }
-
-            serialized_tokenized["num_img_tokens"] = []
-            for data in tokenized:
-                num_img_tokens = [0]
-                if "num_img_tokens" in data:
-                    num_img_tokens = data["num_img_tokens"]
-                    if isinstance(num_img_tokens, int):
-                        num_img_tokens = [num_img_tokens]
-                serialized_tokenized["num_img_tokens"].append(num_img_tokens)
 
         if dist.is_initialized():
             # TODO:
@@ -680,7 +713,7 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
             serialized_tokenized_global = serialized_tokenized
 
         if rank == 0 and cache_dir:
-            save_mixed_dict_to_parquet(serialized_tokenized_global, os.path.join(cache_dir, "jsonl_meta.parquet"))
+            save_dict_to_npy_dir(serialized_tokenized_global, os.path.join(cache_dir, "jsonl_meta"))
 
         self.tokenize_fn.set_state("runtime")
         return serialized_tokenized_global
