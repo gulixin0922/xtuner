@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict
 
 from xtuner.v1.data_proto.messages import ChatMessages
 from xtuner.v1.data_proto.templates import ChatTemplate, HybridChatTemplate
-from xtuner.v1.utils import get_logger
+from xtuner.v1.utils import get_logger, trim_memory
 
 from ..data_item import BaseMLLMDataItem, CacheItem
 from ..utils import CachableTokenizeFunction, tokenizer_xxhash
@@ -118,7 +118,8 @@ def replace_image_token(
 
 
 def load_image(image_path: str):
-    return Image.open(image_path).convert("RGB")
+    with Image.open(image_path) as img:
+        return img.convert("RGB")
 
 
 def get_image_path(image_path: str, media_root: str):
@@ -142,6 +143,7 @@ class BaseMLLMTokenizeFunction(CachableTokenizeFunction[T]):
         hash: str | None = None,
         hash_str: str = "",
         data_name: str | None = None,
+        trim_memory_interval: int = 1,
     ):
         self.max_length = max_length
         self._tokenizer_hash = tokenizer_hash
@@ -155,6 +157,10 @@ class BaseMLLMTokenizeFunction(CachableTokenizeFunction[T]):
         self._image_wh_list: list[list] = []
         self._video_wh_list: list[list] = []
         self._video_extra_info_list: list[dict] = []
+
+        self._trim_memory_interval = trim_memory_interval
+        self._trim_memory_counter = 0
+
         super().__init__(tokenizer)
 
     def calc_num_tokens_multi_modal_get_item(self, data_item: dict) -> CacheItem:
@@ -208,16 +214,23 @@ class BaseMLLMTokenizeFunction(CachableTokenizeFunction[T]):
                 ret = self.calc_num_tokens_multi_modal_get_item(item)
             else:
                 ret = self.multi_modal_get_item(item, media_root)
+                if self._trim_memory_counter % self._trim_memory_interval == 0:
+                    trim_memory()
+                self._trim_memory_counter += 1
         elif len(self._video_path) > 0:
             if self.state == "cache":
                 ret = self.calc_num_tokens_video_get_item(item)
             else:
                 ret = self.video_get_item(item, media_root)
+                if self._trim_memory_counter % self._trim_memory_interval == 0:
+                    trim_memory()
+                self._trim_memory_counter += 1
         else:
             if self.state == "cache":
                 ret = self.calc_num_tokens_pure_text_get_item(item)
             else:
                 ret = self.pure_text_get_item(item)
+
         return ret
 
     def hash(self) -> str:
@@ -250,6 +263,7 @@ class BaseMLLMTokenizeFnConfig(BaseModel):
     oss_time_log_thr: int = 10  # 10s
     add_eos_token: bool = True  # for mllm pretrain
     add_bos_token: bool = False  # for mllm pretrain
+    trim_memory_interval: int = 1
 
     def build(
         self, tokenizer, tokenizer_hash: str | None = None, anno_name: str = "", **kwargs
