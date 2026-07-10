@@ -14,16 +14,65 @@ import json
 import os
 import shutil
 
+# # 路径配置
+# ceph_config = "/mnt/shared-storage-user/gaozhangwei/workspace_glx/petreloss.conf"
+# meta_data_path = '/mnt/shared-storage-user/gaozhangwei/workspace_ysl/reformat_new_data/export_meta_internvl3_5.json'
+# # meta_data_path = '/mnt/shared-storage-user/gaozhangwei/workspace_ysl/reformat_new_data/ceph_meta.json'
+# # meta_data_path = '/mnt/shared-storage-user/gaozhangwei/workspace_ysl/reformat_new_data/local_meta.json'
+# model_path = "/mnt/shared-storage-user/intern7shared/wangweiyun/OpenGVLab-rc1-hf/InternVL3_5-8B-CPT-HF" # 转换后的权重（hf官方格式）
+# work_dir = "/mnt/shared-storage-user/intern7shared/internvl_a4s/xtuner_saved_model/internvl3.5/internvl3.5-8B-sft-bs512-maxsteps8000-lr8e-5"
+# # work_dir = "/mnt/shared-storage-user/intern7shared/internvl_a4s/xtuner_saved_model/internvl3.5/internvl3.5-8B-sft-bs256-maxsteps8000-lr8e-5-ceph-debug"
+# # work_dir = "/mnt/shared-storage-user/intern7shared/internvl_a4s/xtuner_saved_model/internvl3.5/internvl3.5-8B-sft-bs256-maxsteps8000-lr8e-5-local-debug"
+# tokenizer_cache_dir = "/mnt/shared-storage-user/intern7shared/internvl_a4s/xtuner_tokenizer_cache/internvl3.5/slow_tokenize_sft_ml_32k_tokenizer"
+
+
+# # 路径配置
+# ceph_config = "/mnt/shared-storage-user/gaozhangwei/workspace_glx/petreloss.conf"
+# meta_data_path = '/mnt/shared-storage-user/gaozhangwei/workspace_glx/data/export_meta_internvl3_5_sft_subset_and_puretext.json'
+# model_path = "/mnt/shared-storage-user/intern7shared/wangweiyun/OpenGVLab-rc1-hf/InternVL3_5-8B-CPT-HF" # 转换后的权重（hf官方格式）
+# work_dir = "/mnt/shared-storage-user/intern7shared/internvl_a4s/xtuner_saved_model/internvl3.5/internvl3.5-8B-sft-subset-and-puretext-bs512-maxsteps8000-lr8e-5"
+# tokenizer_cache_dir = "/mnt/shared-storage-user/intern7shared/internvl_a4s/xtuner_tokenizer_cache/internvl3.5/slow_tokenize_sft_ml_32k_tokenizer"
+
+
+# # 路径配置
+# ceph_config = "/mnt/shared-storage-user/gaozhangwei/workspace_glx/petreloss.conf"
+# meta_data_path = '/mnt/shared-storage-user/gaozhangwei/workspace_glx/data/interns1_1/cpt_stage2/export_meta_internvl3_5_sft_subset_and_puretext_remove_old_text.json'
+# model_path = "/mnt/shared-storage-user/intern7shared/wangweiyun/OpenGVLab-rc1-hf/InternVL3_5-8B-CPT-HF" # 转换后的权重（hf官方格式）
+# work_dir = "/mnt/shared-storage-user/intern7shared/internvl_a4s/xtuner_saved_model/internvl3.5/internvl3.5-8B-sft-subset-and-puretext-remove-old-text-bs512-maxsteps8000-lr8e-5"
+# tokenizer_cache_dir = "/mnt/shared-storage-user/intern7shared/internvl_a4s/xtuner_tokenizer_cache/internvl3.5/slow_tokenize_sft_ml_32k_tokenizer"
+
+
+# # 路径配置
+# ceph_config = "/mnt/shared-storage-user/gaozhangwei/workspace_glx/petreloss.conf"
+# meta_data_path = '/mnt/shared-storage-user/gaozhangwei/workspace_glx/data/interns1_1/cpt_stage2/export_meta_internvl3_5_sft_subset_and_puretext_reduce_synth.json'
+# model_path = "/mnt/shared-storage-user/intern7shared/wangweiyun/OpenGVLab-rc1-hf/InternVL3_5-8B-CPT-HF" # 转换后的权重（hf官方格式）
+# work_dir = "/mnt/shared-storage-user/intern7shared/internvl_a4s/xtuner_saved_model/internvl3.5/internvl3.5-8B-sft-subset-and-puretext-reduce-synth-bs512-maxsteps8000-lr8e-5"
+# tokenizer_cache_dir = "/mnt/shared-storage-user/intern7shared/internvl_a4s/xtuner_tokenizer_cache/internvl3.5/slow_tokenize_sft_ml_32k_tokenizer"
+
+
+# # 路径配置
+# ceph_config = "/mnt/shared-storage-user/gaozhangwei/workspace_glx/petreloss.conf"
+# meta_data_path = '/mnt/shared-storage-user/gaozhangwei/workspace_glx/data/interns1_1/cpt_stage2/export_meta_internvl3_5_sft_full_add_sci.json'
+# model_path = "/mnt/shared-storage-user/intern7shared/wangweiyun/OpenGVLab-rc1-hf/InternVL3_5-8B-CPT-HF" # 转换后的权重（hf官方格式）
+# work_dir = "/mnt/shared-storage-user/intern7shared/internvl_a4s/xtuner_saved_model/internvl3.5/internvl3.5-8B-sft-full-add-sci-bs512-maxsteps8000-lr8e-5"
+# tokenizer_cache_dir = "/mnt/shared-storage-user/intern7shared/internvl_a4s/xtuner_tokenizer_cache/internvl3.5/slow_tokenize_sft_ml_32k_tokenizer"
+
+
+# # 路径配置
+# ceph_config = "/mnt/shared-storage-user/gaozhangwei/workspace_glx/petreloss.conf"
+# meta_data_path = '/mnt/shared-storage-user/gaozhangwei/workspace_glx/data/interns1_1/cpt_stage2/export_meta_internvl3_5_sft_full_add_sci_ratio2.json'
+# model_path = "/mnt/shared-storage-user/intern7shared/wangweiyun/OpenGVLab-rc1-hf/InternVL3_5-8B-CPT-HF" # 转换后的权重（hf官方格式）
+# work_dir = "/mnt/shared-storage-user/intern7shared/internvl_a4s/xtuner_saved_model/internvl3.5/internvl3.5-8B-sft-full-add-sci-ratio2-bs512-maxsteps8000-lr8e-5"
+# tokenizer_cache_dir = "/mnt/shared-storage-user/intern7shared/internvl_a4s/xtuner_tokenizer_cache/internvl3.5/slow_tokenize_sft_ml_32k_tokenizer"
+
+
 # 路径配置
 ceph_config = "/mnt/shared-storage-user/gaozhangwei/workspace_glx/petreloss.conf"
-meta_data_path = '/mnt/shared-storage-user/gaozhangwei/workspace_ysl/reformat_new_data/export_meta_internvl3_5.json'
-# meta_data_path = '/mnt/shared-storage-user/gaozhangwei/workspace_ysl/reformat_new_data/ceph_meta.json'
-# meta_data_path = '/mnt/shared-storage-user/gaozhangwei/workspace_ysl/reformat_new_data/local_meta.json'
+meta_data_path = '/mnt/shared-storage-user/gaozhangwei/workspace_glx/data/interns1_1/cpt_stage2/export_meta_internvl3_5_v3_change_thinkmode_add_all_sci_and_text_sft.json'
 model_path = "/mnt/shared-storage-user/intern7shared/wangweiyun/OpenGVLab-rc1-hf/InternVL3_5-8B-CPT-HF" # 转换后的权重（hf官方格式）
-work_dir = "/mnt/shared-storage-user/intern7shared/internvl_a4s/xtuner_saved_model/internvl3.5/internvl3.5-8B-sft-bs512-maxsteps8000-lr8e-5"
-# work_dir = "/mnt/shared-storage-user/intern7shared/internvl_a4s/xtuner_saved_model/internvl3.5/internvl3.5-8B-sft-bs256-maxsteps8000-lr8e-5-ceph-debug"
-# work_dir = "/mnt/shared-storage-user/intern7shared/internvl_a4s/xtuner_saved_model/internvl3.5/internvl3.5-8B-sft-bs256-maxsteps8000-lr8e-5-local-debug"
+work_dir = "/mnt/shared-storage-user/intern7shared/internvl_a4s/xtuner_saved_model/internvl3.5/internvl3.5-8B-sft-full-add-all-sci-and-text-bs512-maxsteps8000-lr8e-5"
 tokenizer_cache_dir = "/mnt/shared-storage-user/intern7shared/internvl_a4s/xtuner_tokenizer_cache/internvl3.5/slow_tokenize_sft_ml_32k_tokenizer"
+
 
 # 将当前配置文件拷贝到work_dir
 if not os.path.exists(work_dir):
@@ -41,7 +90,7 @@ global_batch_size = 512
 total_step = 8000
 hf_interval = 1000
 checkpoint_interval = 1000
-checkpoint_maxkeep = 10
+checkpoint_maxkeep = 5
 lr = 8e-5
 lr_min = 1e-6
 weight_decay = 0.05
@@ -85,7 +134,7 @@ for name, _data in ds_collections.items():
 dataloader_config = DataloaderConfig(
     dataset_config_list=dataset_config,
     pack_max_length=pack_max_length,
-    pack_to_max_length=False,
+    pack_to_max_length=True,
     collator="intern_s1_vl_sft_collator",
     num_workers=num_workers,
     pack_extra_buffer_size=20,
@@ -93,7 +142,8 @@ dataloader_config = DataloaderConfig(
 # optimizer and lr config
 optim_cfg = AdamWConfig(lr=lr, weight_decay=weight_decay, foreach=False)
 lr_cfg = LRConfig(lr_type="cosine", warmup_ratio=warmup_ratio, lr_min=lr_min)
-fsdp_cfg = FSDPConfig(sp_size=1, recompute_ratio=recompute_ratio, torch_compile=True,
+fsdp_cfg = FSDPConfig(recompute_ratio=recompute_ratio,
+                      torch_compile=True,
                       checkpoint_preserve_rng_state=False)
 
 resume_cfg = ResumeConfig(auto_resume=True)
