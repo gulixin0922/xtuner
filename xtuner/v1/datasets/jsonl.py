@@ -17,20 +17,20 @@ from io import BytesIO
 from multiprocessing import Process, Queue
 from pathlib import Path
 from threading import Lock
-from typing import Callable, Dict, TypeVar, cast
+from typing import Any, Callable, Dict, TypeVar, cast
 
 import numpy as np
 import torch
 from mmengine import mkdir_or_exist
 from mmengine.dist import barrier, get_rank
+from pydantic import BaseModel
 from torch import distributed as dist
 from tqdm import tqdm
 
 from xtuner.v1.datasets.data_item import CacheItem
 from xtuner.v1.datasets.pt_tokenize_fn.long_text import LongTextPretrainTokenizeFunction
-from xtuner.v1.datasets.rl_tokenize_fn.rl_tokenize_fn import RLTokenizeFn
-from xtuner.v1.utils import SharedMemory, get_logger
-from xtuner.v1.utils.device import get_torch_device_module
+from xtuner.v1.utils import SharedMemory, get_logger, log_rank0
+from xtuner.v1.utils.dist_utils import get_local_process_group, get_local_world_size, is_local_rank0
 
 from .utils import CachableTokenizeFunction, calculate_xxhash
 
@@ -38,7 +38,6 @@ from .utils import CachableTokenizeFunction, calculate_xxhash
 T = TypeVar("T")
 logger = get_logger()
 _lock = Lock()
-DEVICE_MODULE = get_torch_device_module()
 
 CACHE_META = ".xpuyu-cache-meta.json"
 XTUNER_FILE_OPEN_CONCURRENCY = int(os.environ.get("XTUNER_FILE_OPEN_CONCURRENCY", "8"))
@@ -82,6 +81,7 @@ def _filter_sampled_indices(
     sampled: np.ndarray,
     num_tokens: np.ndarray | None,
     max_length: int | None,
+    path: Path | str,
 ) -> np.ndarray:
     # Filter out samples with num_tokens=0, 0 means the sample is damaged
     if num_tokens is not None:
@@ -90,14 +90,14 @@ def _filter_sampled_indices(
         sampled = sampled[num_tokens[sampled] != 0]
         if len(sampled) < orig_sample_num:
             missed = orig_sample_num - len(sampled)
-            logger.warning(f"filtered {missed} damaged samples (num_tokens==0).")
+            log_rank0.warning(f"filtered {missed} damaged samples (num_tokens==0) in {path}.")
 
     if num_tokens is not None and max_length is not None:
         assert isinstance(max_length, int)
         before = len(sampled)
         sampled = sampled[num_tokens[sampled] <= max_length]
         if len(sampled) < before:
-            logger.warning(f"filtered {before - len(sampled)} samples with length>{max_length}.")
+            log_rank0.warning(f"filtered {before - len(sampled)} samples with length>{max_length} in {path}.")
 
     return sampled
 
@@ -207,26 +207,6 @@ def chunk_data_to_queue(
         data_queue.put(None)
 
 
-def _get_local_concurrency():
-    """Get the local concurrency level based on the environment variable."""
-    if dist.is_initialized():
-        local_rank_concurrency = os.getenv("LOCAL_WORLD_SIZE")
-        if local_rank_concurrency is None:
-            local_rank_concurrency = os.getenv("PROC_PER_NODE")
-        if local_rank_concurrency is None:
-            local_rank_concurrency = DEVICE_MODULE.device_count()
-    else:
-        local_rank_concurrency = 1
-    return int(local_rank_concurrency)
-
-
-def _is_local_rank0() -> bool:
-    """Return True if this process is local rank 0."""
-    if not dist.is_initialized():
-        return True
-    return dist.get_rank() % _get_local_concurrency() == 0
-
-
 # NOTE: The `map` or `submit` function of `concurrent.futures.ProcessPoolExecutor` will cause frequent serialization
 # and deserialization of the tokenizer, processing 1000 samples will serialize and deserialize 1000 times, thus
 # affecting performance. Here we redefine `parallel_execute` to bind processes with `tokenize_fn`, so the tokenizer
@@ -240,7 +220,7 @@ def parallel_execute(
     rank: int,
 ):
     cpu_ids = list(os.sched_getaffinity(0))
-    local_rank_concurrency = _get_local_concurrency()
+    local_rank_concurrency = get_local_world_size()
     local_cpu_ids = cpu_ids[rank::local_rank_concurrency]
 
     processes: list[Process] = []
@@ -278,8 +258,6 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
     _thread_executor: ThreadPoolExecutor | None = None
     # TODO: Using shared memory should be optional since the size of `/dev/shm` could be not enough for some devices
     _shared_memory: SharedMemory | None = None
-    offsets: np.ndarray
-    num_tokens: np.ndarray | None
     _meta: dict[str, np.ndarray]
 
     def __init__(
@@ -293,9 +271,11 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
         cache_tag: str | None = None,
         enable_sequential_sampler: bool = False,
         enable_mmap_shared: bool = False,
+        disable_filter: bool = False,
     ):
         super().__init__()
 
+        self.disable_filter = disable_filter
         self.tokenize_fn = tokenize_fn
         self.path = str(anno_path)
         self.name = name
@@ -304,19 +284,18 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
         self.tokenizer_workers = int(os.environ.get("XTUNER_TOKENIZE_WORKERS", 8))
         self.meta_path = os.path.join(cache_dir, CACHE_META) if cache_dir else None
 
-        logger.info(f"[Dataset] Start loading [{self.name}]{self.path} with sample_ratio={sample_ratio}.")
+        logger.debug(f"[Dataset] Start loading [{self.name}]{self.path} with sample_ratio={sample_ratio}.")
 
         self._has_chunk = isinstance(tokenize_fn, LongTextPretrainTokenizeFunction)
 
         tok_cache_dir: str | None = None  # set inside cache_dir branch when tokenize_fn is CachableTokenizeFunction
         if cache_tag is not None and (cached := self._get_cached_tag(cache_tag, tokenize_fn)) is not None:
-            logger.info(f"[Dataset] Load cached [{self.name}]{self.path} of cache tgs {cache_tag}.")
+            logger.debug(f"[Dataset] Load cached [{self.name}]{self.path} of cache tags {cache_tag}.")
             offset_path = cached["offsets"]
             meta_path = cached.get("jsonl_meta")
             offsets = np.load(offset_path, mmap_mode="r" if enable_mmap_shared else None)
             if meta_path:
                 _meta = load_dict_from_npy_dir(meta_path, mmap=enable_mmap_shared)
-                num_tokens = _meta["num_tokens"]
         elif cache_dir:
             self._shared_memory = self._init_shared_memory(anno_path)
             assert self.meta_path is not None
@@ -397,12 +376,10 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
 
                 _meta_file = os.path.join(tok_cache_dir, "jsonl_meta")
                 if os.path.exists(_meta_file):
-                    logger.info(f"Loading tokenize meta from cache: {_meta_file}")
+                    logger.debug(f"Loading tokenize meta from cache: {_meta_file}")
                     _meta = load_dict_from_npy_dir(_meta_file, mmap=enable_mmap_shared)
-                    num_tokens = _meta["num_tokens"]
                 else:
                     _meta = self.count_tokens(offsets, tok_cache_dir)
-                    num_tokens = _meta["num_tokens"]
 
                 if get_rank() == 0:
                     with open(self.meta_path, "r+") as f:
@@ -440,35 +417,30 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
                 barrier()
 
             elif tokenize_fn:
-                logger.warning(
+                log_rank0.warning(
                     f"{tokenize_fn.__class__.__name__} is not an instance of "
                     "`CachableTokenizeFunction`, data will always "
                     "be re-tokenized during training!"
                 )
                 _meta = self.count_tokens(offsets)
-                num_tokens = _meta["num_tokens"]
             else:
                 offsets = offsets
-                num_tokens = None
                 _meta = {}
         else:
             self._shared_memory = self._init_shared_memory(anno_path)
             offsets = self.count_offsets()
-            num_tokens = None
             _meta = {}
             if tokenize_fn is not None:
                 _meta = self.count_tokens(offsets)
-                num_tokens = _meta["num_tokens"]
 
-        # remove num_tokens from _meta, because variable `num_tokens` is already set
-        _meta.pop("num_tokens", None)
+        _meta["offsets"] = offsets
+        if _meta["num_tokens"] is None:
+            _meta.pop("num_tokens")
+
+        ################################## Post-processing of offsets, num_tokens and _meta #######################################
 
         tok_hash_str = ""
-        if isinstance(
-            tokenize_fn, RLTokenizeFn
-        ):  # RLTokenizeFn is CachableTokenizeFunction, but it does not have a hash method
-            tok_hash_str = "RLTokenizeFn"
-        elif isinstance(tokenize_fn, CachableTokenizeFunction):
+        if isinstance(tokenize_fn, CachableTokenizeFunction):
             tok_hash_str = tokenize_fn.hash()
 
         job_discriminator = os.environ.get("MASTER_PORT", "")
@@ -479,85 +451,114 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
             ).hexdigest(),
         )
 
-        if enable_mmap_shared and dist.is_initialized() and _get_local_concurrency() > 1:
-            # Only local rank0 computes sampling and saves to tmp; others mmap-load to share physical pages.
-            if _is_local_rank0():
-                self._set_meta_attrs(
-                    offsets,
-                    num_tokens,
+        if enable_mmap_shared and dist.is_initialized() and get_local_world_size() > 1:
+            _meta_need_update = {}
+            if is_local_rank0():
+                _meta_need_update = self._get_meta_need_update(
                     _meta,
                     sample_ratio=sample_ratio,
                     max_length=max_length,
                     enable_sequential_sampler=enable_sequential_sampler,
                 )
-                os.makedirs(tmp_dir, exist_ok=True)
-                np.save(os.path.join(tmp_dir, "offsets.npy"), self.offsets)
-                if self.num_tokens is not None:
-                    np.save(os.path.join(tmp_dir, "num_tokens.npy"), self.num_tokens)
-                save_dict_to_npy_dir(self._meta, os.path.join(tmp_dir, "meta"))
+                save_dict_to_npy_dir(_meta_need_update, tmp_dir)
                 atexit.register(shutil.rmtree, tmp_dir, True)
-            else:
-                del _meta, offsets
-                if num_tokens is not None:
-                    del num_tokens
-            dist.barrier()
-            self.offsets = np.load(os.path.join(tmp_dir, "offsets.npy"), mmap_mode="r")
-            nt_path = os.path.join(tmp_dir, "num_tokens.npy")
-            self.num_tokens = np.load(nt_path, mmap_mode="r") if os.path.exists(nt_path) else None
-            self._meta = load_dict_from_npy_dir(os.path.join(tmp_dir, "meta"), mmap=True)
+
+            dist.barrier(group=get_local_process_group())
+            _meta_need_update = load_dict_from_npy_dir(tmp_dir, mmap=True)
         else:
-            self._set_meta_attrs(
-                offsets,
-                num_tokens,
+            _meta_need_update = self._get_meta_need_update(
                 _meta,
                 sample_ratio=sample_ratio,
                 max_length=max_length,
                 enable_sequential_sampler=enable_sequential_sampler,
             )
 
+        _meta.update(_meta_need_update)
+        self._meta = _meta
+
         if self._shared_memory is not None:
             self._release_shared_memory()
 
-    def _set_meta_attrs(
+    def _get_meta_need_update(
         self,
-        offsets: np.ndarray,
-        num_tokens: np.ndarray | None,
-        _meta: dict,
+        _meta: dict[str, np.ndarray],
         *,
         sample_ratio: float,
         max_length: int | None,
         enable_sequential_sampler: bool,
-    ) -> None:
-        """Compute sampling and set self.offsets, self.num_tokens,
-        self._meta."""
+    ) -> dict[str, np.ndarray]:
+        """对 _meta 做过滤、采样，返回 _meta 中需要更新的 key-value (即 _meta_need_update)。
+
+        如果使用 LongTextPretrainTokenizeFunction (即 self._has_chunk=True)，还需要将offsets更新为 chunk 对齐后的 offsets。
+
+        需要更新的 _meta_need_update, 在不使用 mmap (enable_mmap_shared=False) 时，后续在各rank会更新_meta。
+        而在使用 mmap 时，local rank0会将 _meta_need_update 保存到 tmp 目录，然后所有rank将通过mmap共享物理页加载。
+
+        在使用 mmap 时，具体有3种情况:
+        1. disable_filter and sample_ratio == 1.0 and not self._has_chunk:
+             所有rank直接使用_meta，因为_meta已经是mmap模式。这是高速通路，保持了meta数据懒加载
+        2. disable_filter and sample_ratio == 1.0 and self._has_chunk:
+            所有rank直接使用_meta，除了_meta["offsets"]。因为 offsets 在 LongTextPretrainTokenizeFunction 时会做扩增。
+            Local rank0将offsets保存到tmp，然后所有rank将通过mmap共享物理页加载。
+        3. 其他情况:
+           只有local rank0过滤和采样样本，然后保存到tmp；所有rank将通过mmap共享物理页加载。
+           这时 offsets.npy 和 jsonl_meta 虽然是懒加载，但是在过滤和采样时都会被加载到内存。是慢速通路。
+
+        Returns:
+            无过滤且 `sample_ratio==1` 时，
+              1) _has_chunk=False 为 `{}`，
+              2) _has_chunk=True 为 `{"offsets": ...}`，
+            3) 否则为与 `_meta` 相同的完整字典。
+        """
+        _meta_need_update = {}
         if self._has_chunk:
             line_idxs = _meta.pop("line_idxs")
-            offsets = offsets[line_idxs]
+            _meta["offsets"] = _meta["offsets"][line_idxs]
             # After line_idxs indexing, offsets has exactly num_chunks elements
             # (no trailing sentinel), so use len(offsets) directly.
-            base_len = len(offsets)
+            base_len = len(_meta["offsets"])
+            _meta_need_update["offsets"] = _meta["offsets"]
         else:
             # offsets has trailing sentinel (file_size), so samples are num_offsets - 1
-            base_len = len(offsets) - 1
+            _meta["offsets"] = _meta["offsets"][:-1]
+            # [:-1] 是 基本切片（basic slicing），得到的是 视图（view），与原来的 _meta["offsets"] 共享同一段底层缓冲区。
+            # 若原数组是 np.load(..., mmap_mode="r") 得到的 memmap，这段缓冲区就是文件 mmap 出来的；
+            # 切片后的数组只是换了 shape/偏移，仍然通过视图链指向同一块 mmap 内存。
+            base_len = len(_meta["offsets"])
+
+        if self.disable_filter and sample_ratio == 1.0:
+            # self._meta = _meta
+            return _meta_need_update
+
         dtype = np.int32 if base_len < np.iinfo(np.int32).max else np.int64
         _sampled = np.arange(base_len, dtype=dtype)
-        _sampled = _filter_sampled_indices(_sampled, num_tokens, max_length)
-        sampled = _apply_sample_ratio(
-            _sampled,
-            sample_ratio=sample_ratio,
-            enable_sequential_sampler=enable_sequential_sampler,
-        )
-        if num_tokens is not None:
-            assert isinstance(num_tokens, np.ndarray)
-            num_tokens = num_tokens[sampled]
-        self.num_tokens = num_tokens
-        self.offsets = offsets[sampled]
+
+        if not self.disable_filter:
+            _sampled = _filter_sampled_indices(_sampled, _meta.get("num_tokens"), max_length, self.path)
+
+        if sample_ratio != 1.0:
+            _sampled = _apply_sample_ratio(
+                _sampled,
+                sample_ratio=sample_ratio,
+                enable_sequential_sampler=enable_sequential_sampler,
+            )
+
         for _, v in _meta.items():
             assert base_len == len(v)
-        self._meta = {}
+        _meta_need_update = {}
         for k, v in _meta.items():
             assert isinstance(v, np.ndarray)
-            self._meta[k] = v[sampled]
+            _meta_need_update[k] = v[_sampled]
+
+        return _meta_need_update
+
+    @property
+    def offsets(self) -> np.ndarray:
+        return self._meta["offsets"]
+
+    @property
+    def num_tokens(self) -> np.ndarray | None:
+        return self._meta.get("num_tokens")
 
     @property
     def proxy_attn_flops(self) -> np.ndarray:
@@ -567,7 +568,7 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
         if dist.is_initialized():
             rank = dist.get_rank()
             output: list[None | str] = [None] * dist.get_world_size()
-            local_concurrency = _get_local_concurrency()
+            local_concurrency = get_local_world_size()
             # Asumming that each node has the same rank
             # This allgather eunsure that each node rank share the same shared memory.
             # For example:
@@ -620,14 +621,32 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
     @staticmethod
     def _tokenize_by_offset(
         data: bytes,
-        tokenize_fn: Callable[[dict], CacheItem],
+        tokenize_fn: Callable[[dict], CacheItem | BaseModel],
     ) -> dict:
         line = data.decode()
-        tokenized: dict = tokenize_fn(json.loads(line))  # type: ignore[assignment]
-        res = {"num_tokens": tokenized["num_tokens"], "proxy_attn_flops": tokenized["proxy_attn_flops"]}
-        if "chunks" in tokenized:
-            res["chunks"] = tokenized["chunks"]
-        return res
+        tokenized = tokenize_fn(json.loads(line))
+        if isinstance(tokenized, dict):
+            res = {"num_tokens": tokenized["num_tokens"], "proxy_attn_flops": tokenized["proxy_attn_flops"]}
+            if "chunks" in tokenized:
+                tokenized = cast(dict[str, Any], tokenized)
+                res["chunks"] = tokenized["chunks"]
+            return res
+        if isinstance(tokenized, BaseModel):
+            # RL tokenize functions return RolloutState, a Pydantic model,
+            # during cache building. Extract cache metadata here so those
+            # tokenizers do not need to return a separate CacheItem dict.
+            num_tokens = getattr(tokenized, "num_tokens", None)
+            if num_tokens is None:
+                raise TypeError(f"{type(tokenized).__name__} must provide `num_tokens` for dataset cache.")
+            proxy_attn_flops = getattr(tokenized, "proxy_attn_flops", None)
+            if proxy_attn_flops is None:
+                proxy_attn_flops = float(num_tokens)
+            res = {"num_tokens": num_tokens, "proxy_attn_flops": proxy_attn_flops}
+            chunks = getattr(tokenized, "chunks", None)
+            if chunks is not None:
+                res["chunks"] = chunks
+            return res
+        raise TypeError(f"{type(tokenized).__name__} must be a CacheItem-like dict or a Pydantic model.")
 
     def count_tokens(self, offsets, cache_dir=None):
         self.tokenize_fn.set_state("cache")
@@ -666,7 +685,7 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
                 shm_name=shm_name,
                 nproc=self.tokenizer_workers,
                 chunksize=chunked_size,
-                rank=rank % _get_local_concurrency(),
+                rank=rank % get_local_world_size(),
             )
         else:
             tokenized = []
@@ -775,7 +794,7 @@ class JsonlDataset(torch.utils.data.Dataset[T | CacheItem]):
         else:
             self._shared_memory.close()
 
-        local_rank_concurrency = _get_local_concurrency()
+        local_rank_concurrency = get_local_world_size()
         if not dist.is_initialized() or dist.get_rank() % local_rank_concurrency == 0:
             self._shared_memory.unlink()
         self._shared_memory = None

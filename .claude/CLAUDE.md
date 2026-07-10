@@ -1,4 +1,4 @@
-# CLAUDE.md — XTuner Programming Standards
+# XTuner Programming Standards
 
 ## Python
 
@@ -94,6 +94,11 @@
 6. **API Contracts**: Do public interface changes maintain backward compatibility? Are deprecation warnings added for breaking changes?
 7. **Resource Cleanup**: Are file handles, NCCL communicators, and CUDA streams properly cleaned up?
 
+### Area-Specific Review Rules
+
+If a PR changes code under `xtuner/v1/rl`, read `.claude/rules/rl_review.md` before commenting or
+posting the final review summary.
+
 ### Review Output Format
 
 When performing code reviews, use the following structure:
@@ -123,3 +128,9 @@ APPROVE / REQUEST_CHANGES / COMMENT
 3. **Suggest a fix** — provide a concrete code suggestion when possible.
 4. **Distinguish severity** — separate critical bugs from style nits.
 5. Do not flag issues in code that is **outside the scope** of the PR diff.
+
+
+
+## Rules
+
+Please refer to the docs in `.claude/rules` for the development guidelines.

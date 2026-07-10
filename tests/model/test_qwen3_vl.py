@@ -2,7 +2,7 @@ import os
 from packaging import version
 import parametrize
 import torch
-from xtuner._testing import patch_hf_rms_norm, DeterministicDDPTestCase
+from xtuner._testing import patch_hf_rms_norm, DeterministicDDPTestCase, patch_hf_rope
 from transformers import AutoTokenizer, AutoModelForImageTextToText
 import torch.distributed as dist
 import tempfile
@@ -139,7 +139,7 @@ class TestQwen3VL(DeterministicDDPTestCase):
 
         seq_ctx_list = [seq_ctx]
         LossContext = loss_cfg.loss_ctx_cls
-        loss_ctx = loss_cfg.build(shifted_labels=shifted_labels, sp_mesh=sp_mesh)
+        loss_ctx = loss_cfg.build(data={"shifted_labels": shifted_labels}, sp_mesh=sp_mesh)
         loss_ctx_list = [loss_ctx]
         loss_ctx_list = LossContext.build_batches(loss_ctx_list)
         loss_ctx = loss_ctx_list[0]
@@ -149,7 +149,7 @@ class TestQwen3VL(DeterministicDDPTestCase):
         with torch.no_grad():
             output = qwen3vl_model(
                 seq_ctx=seq_ctx,
-                loss_ctx=loss_ctx,
+                loss_ctx={"lm": loss_ctx},
             )
         torch.cuda.empty_cache()
         loss = output["loss"]
@@ -173,10 +173,11 @@ class TestQwen3VL(DeterministicDDPTestCase):
             device_map="cuda"
         ).eval()
         patch_hf_rms_norm(hf_model)
+        patch_hf_rope(hf_model)
 
         with torch.device("meta"):
             model_cfg = Qwen3VLDense4BConfig(compile_cfg=False)
-            qwen3vl_model = model_cfg.build().to(torch.bfloat16)
+            qwen3vl_model = model_cfg.build()._to_device_dtype(dtype=torch.bfloat16, skip_buffers_dtype=True)
 
         qwen3vl_model.from_hf(QWEN3_VL_DENSE_PATH)
         qwen3vl_model.eval()
@@ -204,10 +205,11 @@ class TestQwen3VL(DeterministicDDPTestCase):
             device_map="cuda"
         ).eval()
         patch_hf_rms_norm(hf_model)
+        patch_hf_rope(hf_model)
 
         with torch.device("meta"):
             model_cfg = Qwen3VLDense4BConfig(compile_cfg=compile)
-            qwen3vl_model = model_cfg.build().to(torch.bfloat16)
+            qwen3vl_model = model_cfg.build()._to_device_dtype(dtype=torch.bfloat16, skip_buffers_dtype=True)
 
         fsdp_config = FSDPConfig(cpu_offload=False)
         fsdp_mesh = init_world_mesh()
@@ -233,7 +235,7 @@ class TestQwen3VL(DeterministicDDPTestCase):
         self.create_pg(device)
         with torch.device("meta"):
             model_cfg = Qwen3VLMoE30BA3Config()
-            qwen3vl_model = model_cfg.build().to(torch.bfloat16)
+            qwen3vl_model = model_cfg.build()._to_device_dtype(dtype=torch.bfloat16, skip_buffers_dtype=True)
 
         fsdp_config = FSDPConfig(
             tp_size=tp_size,

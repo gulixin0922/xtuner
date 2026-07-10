@@ -55,7 +55,7 @@ class TestQwen3Dense(DeterministicDDPTestCase):
             cfg = Qwen3Dense8BConfig()
             if not compile:
                 cfg.compile_cfg = False
-            qwen_model = cfg.build().to(torch.bfloat16)
+            qwen_model = cfg.build()._to_device_dtype(dtype=torch.bfloat16, skip_buffers_dtype=True)
 
         shift_input_ids = input_ids[:, :-1]
         shifted_labels = input_ids[:, 1:]
@@ -64,7 +64,7 @@ class TestQwen3Dense(DeterministicDDPTestCase):
         loss_cfg = CELossConfig()
         seq_ctx_list = [seq_ctx]
         LossContext = loss_cfg.loss_ctx_cls
-        loss_ctx = loss_cfg.build(shifted_labels=shifted_labels, sp_mesh=None)
+        loss_ctx = loss_cfg.build(data={"shifted_labels": shifted_labels}, sp_mesh=None)
         loss_ctx_list = [loss_ctx]
         loss_ctx_list = LossContext.build_batches(loss_ctx_list)
         loss_ctx = loss_ctx_list[0]
@@ -75,7 +75,7 @@ class TestQwen3Dense(DeterministicDDPTestCase):
         with torch.no_grad():
             output = qwen_model(
                 seq_ctx=seq_ctx,
-                loss_ctx=loss_ctx,
+                loss_ctx={"lm": loss_ctx},
             )
         loss = output["loss"]
         self.assertTrue(torch.allclose(loss, expected_loss.to(loss.dtype), atol=tol, rtol=tol))
@@ -107,7 +107,7 @@ class TestQwen3Dense(DeterministicDDPTestCase):
 
         with torch.device("meta"):
             cfg = Qwen3Dense8BConfig(compile_cfg=False)
-            qwen_model = cfg.build().to(torch.bfloat16)
+            qwen_model = cfg.build()._to_device_dtype(dtype=torch.bfloat16, skip_buffers_dtype=True)
 
         fsdp_config = FSDPConfig(
             tp_size=tp_size,
@@ -120,7 +120,7 @@ class TestQwen3Dense(DeterministicDDPTestCase):
         seq_ctx = SequenceContext.from_input_ids(input_ids=(shift_input_ids.to('cuda'),))
         seq_ctx_list = [seq_ctx]
         LossContext = loss_cfg.loss_ctx_cls
-        loss_ctx = loss_cfg.build(shifted_labels=shifted_labels, sp_mesh=None)
+        loss_ctx = loss_cfg.build(data={"shifted_labels": shifted_labels}, sp_mesh=None)
         loss_ctx_list = [loss_ctx]
         loss_ctx_list = LossContext.build_batches(loss_ctx_list)
         loss_ctx = loss_ctx_list[0]
@@ -131,7 +131,7 @@ class TestQwen3Dense(DeterministicDDPTestCase):
         with torch.no_grad():
             output = qwen_model(
                 seq_ctx=seq_ctx,
-                loss_ctx=loss_ctx,
+                loss_ctx={"lm": loss_ctx},
             )
         loss = output["loss"]
         self.assertTrue(torch.allclose(loss, expected_loss.to(loss.dtype), atol=1e-2, rtol=1e-2))
@@ -158,7 +158,7 @@ class TestQwen3Dense(DeterministicDDPTestCase):
                                  use_sliding_window=use_sliding_window,
                                  max_window_layers=max_window_layers,
                                  attention=attention)
-            qwen_model = cfg.build().to(torch.bfloat16)
+            qwen_model = cfg.build()._to_device_dtype(dtype=torch.bfloat16, skip_buffers_dtype=True)
         loss_cfg = CELossConfig()
 
         if use_sliding_window is False or max_window_layers >= num_hidden_layers:
@@ -186,7 +186,7 @@ class TestQwen3Dense(DeterministicDDPTestCase):
                                      use_sliding_window=use_sliding_window,
                                      max_window_layers=max_window_layers,
                                      attention=attention)
-                qwen_model = cfg.build().to(torch.bfloat16)
+                qwen_model = cfg.build()._to_device_dtype(dtype=torch.bfloat16, skip_buffers_dtype=True)
 
             fsdp_config = FSDPConfig()
             tokenizer = AutoTokenizer.from_pretrained(QWEN3_PATH, trust_remote_code=True)
@@ -196,7 +196,7 @@ class TestQwen3Dense(DeterministicDDPTestCase):
             seq_ctx = SequenceContext.from_input_ids(input_ids=(shift_input_ids.to('cuda'),))
             seq_ctx_list = [seq_ctx]
             LossContext = loss_cfg.loss_ctx_cls
-            loss_ctx = loss_cfg.build(shifted_labels=shifted_labels, sp_mesh=None)
+            loss_ctx = loss_cfg.build(data={"shifted_labels": shifted_labels}, sp_mesh=None)
             loss_ctx_list = [loss_ctx]
             loss_ctx_list = LossContext.build_batches(loss_ctx_list)
             loss_ctx = loss_ctx_list[0]
@@ -207,7 +207,7 @@ class TestQwen3Dense(DeterministicDDPTestCase):
             with torch.no_grad():
                 output = qwen_model(
                     seq_ctx=seq_ctx,
-                    loss_ctx=loss_ctx,
+                    loss_ctx={"lm": loss_ctx},
                 )
             assert "loss" in output
 
@@ -221,7 +221,7 @@ class TestQwen3Dense(DeterministicDDPTestCase):
         self.create_pg(device)
         with torch.device("meta"):
             cfg = Qwen3Dense8BConfig()
-            qwen_model = cfg.build().to(torch.bfloat16)
+            qwen_model = cfg.build()._to_device_dtype(dtype=torch.bfloat16, skip_buffers_dtype=True)
 
         fsdp_config = FSDPConfig(
             tp_size=tp_size,

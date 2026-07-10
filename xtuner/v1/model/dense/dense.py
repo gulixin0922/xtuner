@@ -11,7 +11,6 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
-    fully_shard,
 )
 from torch.distributed.tensor import DTensor
 from tqdm import tqdm
@@ -20,7 +19,7 @@ from typing_extensions import overload, override
 from xtuner.v1.config import FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.float8.float8_handler import Float8Handler
-from xtuner.v1.loss import CELossContext
+from xtuner.v1.loss import BaseLossContext, CELossContext
 from xtuner.v1.model.base import (
     DEFAULT_FLOAT8_CFG,
     BaseModel,
@@ -35,13 +34,12 @@ from xtuner.v1.module import (
     MHAConfig,
     MLAConfig,
     RMSNorm,
-    RotaryEmbeddingProtocol,
-    get_rope_embedding,
 )
 from xtuner.v1.module.decoder_layer.dense_decoder_layer import DenseDecoderLayer
 from xtuner.v1.utils import (
     get_device,
     get_logger,
+    log_rank0,
 )
 
 
@@ -79,7 +77,7 @@ class Dense(BaseModel):
     def forward(
         self,
         seq_ctx: SequenceContext,  # todo(@yehaochen): support intra layer micro-batch
-        loss_ctx: CELossContext,
+        loss_ctx: dict[str, BaseLossContext | list[BaseLossContext]] | None = None,
     ) -> ModelOutputs:
         input_ids = seq_ctx.input_ids
         position_ids = seq_ctx.position_ids
@@ -111,10 +109,17 @@ class Dense(BaseModel):
 
         hidden_states = self.norm(hidden_states)
 
-        loss, (logits, extra_info) = self.lm_head(hidden_states, loss_ctx)
-        output["loss"] = loss
-        output["logits"] = logits
-        output["extra_info"] = extra_info
+        if loss_ctx is None:
+            # Inference mode
+            _, (logits, _) = self.lm_head(hidden_states, None)
+            output["logits"] = logits
+        else:
+            # Training mode
+            loss, (logits, extra_info) = self.lm_head(hidden_states, loss_ctx["lm"])  # type: ignore[call-overload]
+            output["loss"] = loss
+            output["logits"] = logits
+            output["extra_info"] = extra_info
+
         return ModelOutputs(**output)
 
     def build_embeddings(self, config: TransformerConfig):
@@ -144,6 +149,7 @@ class Dense(BaseModel):
                 mlp_bias=config.mlp_bias,
                 hidden_act=config.hidden_act,
                 rms_norm_eps=config.rms_norm_eps,
+                rms_norm_type=config.rms_norm_type,
                 attention_config=attention_config,
                 generate_config=config.generate_config,
                 rope_scaling_cfg=config.rope_scaling_cfg,
@@ -152,10 +158,6 @@ class Dense(BaseModel):
                 layer_idx=layer_idx,
             )
         return layers
-
-    def build_rotary_embedding(self, config: TransformerConfig) -> RotaryEmbeddingProtocol:
-        with torch.device(DEVICE):
-            return get_rope_embedding(config=config)
 
     @property
     @override
@@ -167,7 +169,7 @@ class Dense(BaseModel):
     def __call__(  # type: ignore
         self,
         seq_ctx: SequenceContext,
-        loss_ctx: CELossContext,
+        loss_ctx: dict[str, CELossContext] | None = None,
     ) -> ModelOutputs: ...
 
     __call__ = nn.Module.__call__
@@ -197,7 +199,7 @@ class Dense(BaseModel):
         checkpoint_preserve_rng_state = fsdp_config.checkpoint_preserve_rng_state
         if not checkpoint_preserve_rng_state and self.config.attention.dropout > 0.0:
             checkpoint_preserve_rng_state = True
-            logger.warning("When using dropout, checkpoint_preserve_rng_state is set to True to avoid issues.")
+            log_rank0.warning("When using dropout, checkpoint_preserve_rng_state is set to True to avoid issues.")
 
         # Just for narrowing the type of self.fsdp_mesh and self.ep_mesh
         assert self.fsdp_mesh is not None
@@ -238,16 +240,21 @@ class Dense(BaseModel):
                 )
                 # __class__ without self attribute
 
+                # Linear-attention (GatedDeltaNet) layers write ``seq_ctx.seq_idx`` inside the
+                # checkpoint region; compiling the wrapped layer with ``fullgraph=True`` turns the
+                # checkpoint into a HigherOrderOperator that rejects that side effect. Such layers are
+                # still compiled, but with ``fullgraph=False`` so the write can graph-break.
                 if self.compile_cfg:
-                    layer.forward = torch.compile(layer.forward, fullgraph=True)
+                    fullgraph = self.config.layers_type[layer_idx] != "linear_attention"
+                    layer.forward = torch.compile(layer.forward, fullgraph=fullgraph)
 
             self.layers[str(layer_idx)] = layer
-            fully_shard(
-                layer,
+            self._fully_shard(
                 mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
                 mp_policy=mp_policy,
                 reshard_after_forward=self.fsdp_config.reshard_after_forward,
                 offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+                module=layer,
             )
 
         for layer_cur, layer_next in zip(
@@ -256,32 +263,31 @@ class Dense(BaseModel):
         ):
             layer_cur.set_modules_to_forward_prefetch([layer_next])  # type: ignore
 
-        fully_shard(
-            self.embed_tokens,
+        self._fully_shard(
             mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
             mp_policy=lm_head_mp_policy if self.config.tie_word_embeddings else mp_policy,
             reshard_after_forward=self.fsdp_config.reshard_after_forward,
             offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+            module=self.embed_tokens,
         )
 
-        fully_shard(
-            self.norm,
+        self._fully_shard(
             mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
             mp_policy=mp_policy,
             reshard_after_forward=self.fsdp_config.reshard_after_forward,
             offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+            module=self.norm,
         )
 
-        fully_shard(
-            self.lm_head,
+        self._fully_shard(
             mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
             mp_policy=lm_head_mp_policy,
             reshard_after_forward=self.fsdp_config.reshard_after_forward,
             offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+            module=self.lm_head,
         )
 
-        fully_shard(
-            self,
+        self._fully_shard(
             mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
             mp_policy=mp_policy,
             reshard_after_forward=self.fsdp_config.reshard_after_forward,

@@ -20,7 +20,7 @@ def update_meta(ori_meta_file, new_meta):
 
 
 def get_latest_subdir(work_dir):
-    dirs = [d for d in os.listdir(work_dir) if os.path.isdir(os.path.join(work_dir, d))]
+    dirs = [d for d in os.listdir(work_dir) if os.path.isdir(os.path.join(work_dir, d)) and len(d) == 14 and d.isdigit()]
 
     if not dirs:
         return None
@@ -29,15 +29,10 @@ def get_latest_subdir(work_dir):
     return os.path.join(work_dir, latest)
 
 
-device = os.environ.get("DEVICE", "")
-if device == "npu":
-    base_dir = (
-        f"{sys.argv[1]}/{os.environ['GITHUB_RUN_ID']}/npu-qwen3-sft-ep8/sft"
-    )
-else:
-    base_dir = (
-        f"{sys.argv[1]}/{os.environ['GITHUB_RUN_ID']}/qwen3-sft-ep8/sft"
-    )
+base_dir = f"{sys.argv[1]}/{os.environ['GITHUB_RUN_ID']}/{sys.argv[2]}/{sys.argv[3]}"
 real_dir = get_latest_subdir(base_dir)
 new_meta = {"end": 10, "exp_dir": real_dir, "checkpoint_list": [f"{real_dir}/checkpoints/ckpt-step-10"]}
-update_meta(f"{base_dir}/.xtuner", new_meta)
+if sys.argv[3] == "rl":
+    update_meta(f"{base_dir}/.xtuner_grpo", new_meta)
+else:
+    update_meta(f"{base_dir}/.xtuner", new_meta)

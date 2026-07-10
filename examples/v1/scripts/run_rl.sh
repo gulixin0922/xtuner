@@ -5,7 +5,6 @@ ray stop --force
 # bash examples/v1/scripts/run_rl.sh examples/v1/config/rl_qwen3_8B_grpo.py "sglang" $MODEL_PATH $DATA_PATH $EVAL_DATA_PATH
 # qwen2.5_7B_dapo_math training: 
 # bash examples/v1/scripts/run_rl.sh  examples/v1/config/rl_qwen25_7B_dapo.py "sglang" $MODEL_PATH $DATA_PATH $EVAL_DATA_PATH
-
 CONFIG_PATH=$1
 INFER_BACKEND=$2
 MODEL_PATH=$3
@@ -18,10 +17,22 @@ if [ $ACCELERATOR != "GPU" ] && [ $ACCELERATOR != "NPU" ]; then
   exit 1
 fi
 if [ "$ACCELERATOR" = "NPU" ]; then
-  ACCELERATOR_PER_NODE=${7:-16}
+  accelerator_per_node=${7:-16}
 else
-  ACCELERATOR_PER_NODE=${7:-8}
+  if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    IFS=',' read -ra visible_devices <<< "${CUDA_VISIBLE_DEVICES}"
+    accelerator_per_node=${#visible_devices[@]}
+  else
+    accelerator_per_node=${7:-8}
+  fi
 fi
+export ACCELERATOR
+RAY_ACCELERATOR_ARGS=()
+if [ "$ACCELERATOR" = "GPU" ]; then
+  RAY_ACCELERATOR_ARGS=(--num-gpus="$accelerator_per_node")
+fi
+
+ulimit -n 65536  # OSError: [Errno 24] Too many open files
 
 export PYTHONPATH=$(pwd):$PYTHONPATH
 
@@ -32,10 +43,7 @@ export RANK=${NODE_RANK:-"0"}
 export RAY_MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 export RAY_RANK=${RANK:-0} # 0 代表主节点, >0 代表工作节点
 export RAY_HEAD_PORT=${RAY_HEAD_PORT:-"6379"}
-export RAY_CLIENT_PORT=${RAY_CLIENT_PORT:-"10001"}
 export RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-"8265"}
-# TODO: 提供非环境变量方式配置 ray_max_concurrency
-export RAY_MAX_CONCURRENCY=${RAY_MAX_CONCURRENCY:-1024} # dataflow_max_concurrency * prompt_repeat_k
 
 # xtuner 环境变量
 export MODEL_PATH=$MODEL_PATH
@@ -50,6 +58,7 @@ if [ "$infer_backend_lower" = "sglang" ]; then
   export XTUNER_USE_SGLANG=1
   unset PYTORCH_CUDA_ALLOC_CONF
   export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+  export SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=False
 elif [ "$infer_backend_lower" = "lmdeploy" ]; then
   export XTUNER_USE_LMDEPLOY=1
   export PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True'
@@ -87,11 +96,8 @@ fi
 # 2. Launch Ray cluster
 # 根据 NODE_COUNT 分配 num_cpus, 防止内存OOM
 node_count=${NODE_COUNT:-1}
-if [ "$ACCELERATOR" = "GPU" ]; then
-  total_cpus=$((node_count * 128))
-elif [ "$ACCELERATOR" = "NPU" ]; then
-  total_cpus=$((node_count * 256))
-fi
+expected_accelerator_count=$((node_count * accelerator_per_node))
+export XTUNER_RL_NUM_WORKERS=${XTUNER_RL_NUM_WORKERS:-$expected_accelerator_count}
 
 WORK_DIR=$(realpath "$WORK_DIR")
 if [ "$RAY_RANK" -eq 0 ]; then
@@ -106,7 +112,7 @@ if [ "$RAY_RANK" -eq 0 ]; then
     --dashboard-port=$RAY_DASHBOARD_PORT \
     --include-dashboard=true \
     --disable-usage-stats \
-    --num-cpus=$total_cpus \
+    "${RAY_ACCELERATOR_ARGS[@]}" \
     --temp-dir="/tmp/ray_log/"
 else
   while true; do
@@ -118,12 +124,11 @@ else
       sleep 2
     fi
   done
-  ray start --address="$RAY_MASTER_ADDR:$RAY_HEAD_PORT" --block --disable-usage-stats
+  ray start --address="$RAY_MASTER_ADDR:$RAY_HEAD_PORT" --block --disable-usage-stats "${RAY_ACCELERATOR_ARGS[@]}"
 fi
 
 while true; do
   result=$(ray status | grep ${ACCELERATOR} | cut -d ' ' -f2 | cut -d '/' -f2)
-  expected_accelerator_count=$((node_count * ${ACCELERATOR_PER_NODE}))
   if [ "$result" = "$expected_accelerator_count.0" ]; then
     break
   else
@@ -139,4 +144,5 @@ LOG_FILE="${WORK_DIR}/training_log_${current_time}.txt"
 
 python xtuner/v1/train/cli/rl.py \
     --config $CONFIG_PATH \
+    --num-workers $XTUNER_RL_NUM_WORKERS \
     2>&1 | tee -a "${WORK_DIR}/training_log_${current_time}.txt"

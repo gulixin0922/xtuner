@@ -11,10 +11,9 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 import torch.nn as nn
 import torch.nn.functional as F
-from xtuner.v1.rl.oreal.loss import OrealLossConfig, OrealLossContext
+from xtuner.v1.rl.loss import OrealLossConfig, OrealLossContext, kl_penalty
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.rl.utils import gather_logprobs
-from xtuner.v1.rl.loss_fn import kl_penalty
 from xtuner.v1.data_proto.utils import unpack_sequence
 from xtuner.v1.utils.test_utils import init_data_mesh
 
@@ -216,8 +215,7 @@ class TestOrealLoss(DistributedTestBase):
                 seq_ctx = seq_ctx.split(sp_mesh)
             seq_ctx_list.append(seq_ctx)
             loss_ctx = loss_cfg.build(
-                shifted_labels=shifted_labels_list_rank[iter_idx], 
-                advantages=advantages_list_rank[iter_idx], 
+                data={"shifted_labels": shifted_labels_list_rank[iter_idx], "advantages": advantages_list_rank[iter_idx]},
                 sp_mesh=sp_mesh,
             )
             loss_ctx_list.append(loss_ctx)

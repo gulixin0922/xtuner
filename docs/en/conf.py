@@ -105,23 +105,27 @@ autodoc_mock_imports = [
     "safetensors",
     "loguru",
     "datasets",
+    "pandas",
     "scikit-image",
-    "scipy"
+    "scipy",
     "torchvision",
+    "fla",
     "xxhash",
     "timm",
     "imageio",
-    "torchvision",
+    "lagent",
     "httpx",
+    "aiohttp",
     "cv2",
     "addict",
-    "torchvision",
     "PIL",
     "uvicorn",
     "fastapi",
     "huggingface_hub",
     "more_itertools",
     "pyarrow",
+    "fla",
+    "causal_conv1d_cuda",
 ]
 
 
@@ -138,5 +142,3 @@ autodoc_mock_imports = [
 # autodoc.ClassDocumenter = MockedClassDocumenter
 
 navigation_with_keys = False
-
-

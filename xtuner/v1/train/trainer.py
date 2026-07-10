@@ -5,12 +5,24 @@ import json
 import os
 import pickle
 import sys
+import threading
 import time
+from concurrent.futures import Future, wait
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from shutil import rmtree
-from typing import Annotated, Callable, Literal, Protocol, Sequence, Sized, cast, overload, runtime_checkable
+from typing import (
+    Annotated,
+    Callable,
+    Literal,
+    Protocol,
+    Sequence,
+    Sized,
+    cast,
+    overload,
+    runtime_checkable,
+)
 
 import torch
 import torch.distributed as dist
@@ -32,10 +44,15 @@ from xtuner.v1.data_proto.sequence_context import SequenceContext
 from xtuner.v1.datasets.config import BaseDataloaderConfig, DataloaderConfig, DatasetConfigList
 from xtuner.v1.engine import TrainEngine
 from xtuner.v1.engine.train_engine import TrainStepInfo
-from xtuner.v1.loss import CELossConfig, CELossContext
+from xtuner.v1.loss import CELossConfig
 from xtuner.v1.model.base import ModelItem, XTunerBaseModelConfig
 from xtuner.v1.model.moe.moe import MoEConfig
-from xtuner.v1.patch import patch_default_save_plan
+from xtuner.v1.patch import (
+    patch_dcp_async_daemon_port,
+    patch_dcp_save_state_dict,
+    patch_dcp_save_with_cache_storage,
+    patch_default_save_plan,
+)
 from xtuner.v1.profiler import profiling_memory, profiling_time
 from xtuner.v1.profiler.prober import ProberList
 from xtuner.v1.profiler.prober_utils import setup_prober_list
@@ -46,9 +63,12 @@ from xtuner.v1.utils import (
     get_logger,
     is_hf_model_path,
     log_format,
+    log_rank0,
     profile_time_and_memory,
     record_git_info,
+    set_deterministic,
 )
+from xtuner.v1.utils.async_save_monitor import AsyncSaveMonitor, AsyncSaveWatchItem
 from xtuner.v1.utils.check_health import check_health
 from xtuner.v1.utils.device import get_device, get_torch_device_module
 from xtuner.v1.utils.internal_metrics import (
@@ -86,11 +106,9 @@ class ExpHistory(TypedDict):
 class PerformanceStatistics(TypedDict):
     local_step_consumed_tokens: int
     local_step_consumed_img_tokens: int | None
-    step_consumed_tokens: int
-    total_consumed_tokens: int
-    total_consumed_tokens_per_rank: float
+    local_total_consumed_tokens: int
+    approximate_total_consumed_tokens: int
     tgs: float
-    e2e_tgs: float
     exp_tgs: float
     eta_seconds: float
     eta_hms: str
@@ -160,6 +178,69 @@ class XTunerMeta(BaseModel):
                 if cp == checkpoint:
                     return exp
         return None
+
+    @classmethod
+    def build(cls, work_dir: Path, meta_filename: str, resume: bool) -> "XTunerMeta":
+        """Create or load meta from work_dir and optionally start a new exp or
+        resume.
+
+        Single-process helper (e.g. for rl_trainer). For distributed training use the trainer's _init_xtuner_meta.
+        """
+        if not work_dir.exists():
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+        meta_path = work_dir / meta_filename
+        if not meta_path.exists():
+            meta = cls(exps=[])
+            with open(meta_path, "w") as f:
+                f.write(meta.model_dump_json(indent=2))
+
+        meta = cast(XTunerMeta, cls.model_validate(load(meta_path, file_format="json")))
+        resume = resume and bool(meta.exps)
+
+        if resume and meta.exps:
+            latest_exp = meta.exps[-1]
+            latest_exp_history = latest_exp.history[-1]
+            begin = cast(int, latest_exp_history.get("end") or latest_exp_history["begin"])
+            exp_dir = Path(latest_exp.exp_dir)
+            git_dir = exp_dir / f"git-info-begin-{begin}"
+            if not git_dir.exists():
+                git_dir.mkdir(parents=True, exist_ok=True)
+            staged_path, unstaged_path = git_dir / "staged.diff", git_dir / "unstaged.diff"
+            commit = record_git_info(staged_path, unstaged_path)
+            git_info = GitInfo(
+                commit=commit,
+                staged=str(staged_path),
+                unstaged=str(unstaged_path),
+            )
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            new_exp_history = ExpHistory(
+                begin=begin,
+                timestamp=timestamp,
+                git_info=git_info,
+            )
+            latest_exp.history.append(new_exp_history)
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            exp_dir = work_dir / timestamp
+            git_dir = Path(f"{exp_dir}/git-info-begin-0")
+            if not git_dir.exists():
+                git_dir.mkdir(parents=True, exist_ok=True)
+            staged_path, unstaged_path = git_dir / "staged.diff", git_dir / "unstaged.diff"
+            commit = record_git_info(staged_path, unstaged_path)
+            git_info = GitInfo(
+                commit=commit,
+                staged=str(staged_path),
+                unstaged=str(unstaged_path),
+            )
+            new_history = ExpHistory(
+                begin=0,
+                timestamp=timestamp,
+                git_info=git_info,
+            )
+            new_exp = ExpInfo(history=[new_history], exp_dir=str(exp_dir))
+            meta.exps.append(new_exp)
+        return meta
 
 
 class ResumeConfig(BaseModel):
@@ -336,7 +417,10 @@ class TrainerConfig(BaseModel):
     strict_load: bool = True
     checkpoint_interval: int | None = -1
     checkpoint_maxkeep: int | None = -1
+    async_hf_export: bool = False
     skip_checkpoint_validation: bool = False  # Suggest enabled if fsdp_size is larger than 512
+    patch_for_dcp_finish: bool = False
+    async_checkpoint: bool = False
     snapshot_interval: int | None = None
     check_health_interval: int | None = None
     hf_interval: int | None = None
@@ -409,6 +493,7 @@ class Trainer:
         strict_load (bool): Whether to strictly load model weights.
         checkpoint_interval (int | None): Interval for saving checkpoints.
         checkpoint_maxkeep (int | None): Maximum number of checkpoints to keep.
+        patch_for_dcp_finish (bool): If True, skip returning finish_checkpoint result.
         hf_interval (int | None): Interval for saving Huggingface format checkpoints.
         hf_max_keep (int | None): Maximum number of Huggingface checkpoints to keep.
         profile_step (list[int] | int | None): Step to perform profiling.
@@ -427,8 +512,7 @@ class Trainer:
     _EXP_TRACKING_PATH = "exp_tracking"
     _CHECKPOINT_DIR = "checkpoints"
 
-    _SAVE_OPTIMIZER_DIR = "optimizer"
-    _SAVE_MODEL_DIR = "model"
+    _SAVE_WEIGHTS_DIR = "weights"
     _SAVE_DATALOADER_DIR = "dataloader"
     _SAVE_SCHEDULER_DIR = "lr_scheduler"
     _SAVE_TRAIN_STATE_PATH = "train_state.json"
@@ -458,7 +542,10 @@ class Trainer:
         strict_load: bool = True,
         checkpoint_interval: int | None = -1,
         checkpoint_maxkeep: int | None = -1,
+        async_hf_export: bool = False,
         skip_checkpoint_validation: bool = False,  # Suggest enabled if fsdp_size is larger than 512
+        patch_for_dcp_finish: bool = False,
+        async_checkpoint: bool = False,
         snapshot_interval: int | None = None,
         check_health_interval: int | None = None,
         hf_interval: int | None = None,
@@ -494,6 +581,18 @@ class Trainer:
         if skip_checkpoint_validation:
             patch_default_save_plan()
 
+        # Keep the DCP async checkpoint daemon port out of the kernel ephemeral range to
+        # avoid the TCPStore EADDRINUSE race where get_free_port's port is grabbed by a
+        # transient connection during the spawn window (more likely at large scale).
+        # Only relevant to async (process) checkpointing, so gate it on async_checkpoint.
+        if async_checkpoint:
+            patch_dcp_async_daemon_port()
+
+        if patch_for_dcp_finish:
+            if torch.__version__.startswith("2.7."):
+                patch_dcp_save_state_dict()
+                patch_dcp_save_with_cache_storage()
+
         if isinstance(profile_step, int):
             profile_step = [profile_step]
         self._profile_step = profile_step
@@ -503,19 +602,10 @@ class Trainer:
 
         is_hf_path, error_info = is_hf_model_path(load_from) if load_from is not None else False, None
         self._load_from_hf = is_hf_path
-        self._can_save_hf = model_cfg.hf_config is not None or self._load_from_hf
-
-        if not self._can_save_hf:
-            assert_info = (
-                f"`hf_interval`: {hf_interval} and `hf_max_keep`: {hf_max_keep} "
-                f"should be None when `load_from` is not a Huggingface model path, "
-            )
-            if is_hf_path is False and error_info is not None:
-                assert_info += f", HF path load error Info: {error_info}"
-            assert hf_interval is None and hf_max_keep is None, assert_info
 
         self._checkpoint_interval = checkpoint_interval
         self._checkpoint_maxkeep = checkpoint_maxkeep
+        self._init_async_save_resources(async_hf_export=async_hf_export, async_checkpoint=async_checkpoint)
         self._snapshot_interval = snapshot_interval
         self._check_health_interval = check_health_interval
         self._hf_max_keep = hf_max_keep
@@ -529,9 +619,12 @@ class Trainer:
         self._debug = debug
         self._seed = seed
 
-        self._total_consumed_tokens = 0
-        self._exp_consumed_tokens = 0
-        self._total_consumed_samples = 0
+        # 日志变量前缀规则：
+        # 空间上，当前rank的用 local_，默认 reduced 无前缀
+        # 时间上，当前步用 step_, 累积用 total_
+        # self._local_total_consumed_tokens 表示时间上累积到现在的当前rank的和，resume则只考虑resume步数到现在
+        self._local_total_consumed_tokens = 0
+        self._init_total_tokens = 0
 
         self._train_time = 0
         self._train_time_offset = 0
@@ -550,7 +643,7 @@ class Trainer:
         self.logger, log_dir = self._init_logger(self._log_dir)  # depends on log_dir and init_dist(get_rank)
 
         # After init logger
-        logger.warning("`resume_cfg` is deprecated, please use `auto_resume` and `load_checkpoint_cfg` instead")
+        log_rank0.warning("`resume_cfg` is deprecated, please use `auto_resume` and `load_checkpoint_cfg` instead")
 
         # self._try_bind_numa()
         self._set_deterministic()
@@ -561,7 +654,7 @@ class Trainer:
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
         else:
             self.tokenizer = UTF8ByteTokenizer()
-            logger.info(f"Using toy tokenizer: {self.tokenizer}!")
+            log_rank0.info(f"Using toy tokenizer: {self.tokenizer}!")
 
         self._load_checkpoint_cfg = self._resolve_load_checkpoint_cfg(self._auto_resume, load_checkpoint_cfg)
 
@@ -576,16 +669,21 @@ class Trainer:
         self.sp_mesh = self.data_mesh["sp"]
 
         if global_batch_size is None:
-            global_batch_size = self.data_mesh["dp"].size()
+            global_batch_size = self.data_mesh["dp"].size() * intra_layer_micro_batch
         self._global_batch_size = global_batch_size
+
+        self._resolve_model_loss_cfg(model_cfg, loss_cfg)
+
+        if loss_cfg is None:
+            loss_cfg = CELossConfig()
 
         self._resolve_config_conflicts(self.tokenizer, model_cfg, dataloader_cfg, fsdp_cfg)
 
         if dataset_cfg is not None:  # TODO: Removed in version 1.1.0
-            logger.warning("`dataset_cfg` is deprecated, please use `dataloader_cfg.dataset_config_list` instead")
+            log_rank0.warning("`dataset_cfg` is deprecated, please use `dataloader_cfg.dataset_config_list` instead")
             # For backward compatibility, reserve the dataset_cfg interface, remove it later
             if dataloader_cfg.dataset_config_list is not None:
-                logger.warning("Outside dataset_cfg will override inner dataset_config_list")
+                log_rank0.warning("Outside dataset_cfg will override inner dataset_config_list")
             dataloader_cfg.dataset_config_list = dataset_cfg
 
         self._dataloader = dataloader_cfg.build(
@@ -606,6 +704,17 @@ class Trainer:
         if isinstance(load_from, str):
             load_from = Path(load_from)
 
+        self._can_save_hf = model_cfg.hf_config is not None or self._load_from_hf
+        if not self._can_save_hf:
+            assert_info = (
+                f"`hf_interval`: {hf_interval}, `hf_max_keep`: {hf_max_keep} and "
+                f"`async_hf_export`: {async_hf_export} "
+                f"should be None when `load_from` is not a Huggingface model path, "
+            )
+            if is_hf_path is False and error_info is not None:
+                assert_info += f", HF path load error Info: {error_info}"
+            assert hf_interval is None and hf_max_keep is None and async_hf_export is False, assert_info
+
         self._engine = self.build_engine(
             model_path=load_from,
             model_config=model_cfg,
@@ -618,8 +727,6 @@ class Trainer:
         self._lr_cfg = lr_cfg
         self._lr_scheduler = self.build_lr_scheduler(lr_cfg, self.total_step)
 
-        if loss_cfg is None:
-            loss_cfg = CELossConfig()
         self.loss_cfg = loss_cfg
 
         if debug:
@@ -641,6 +748,16 @@ class Trainer:
         setup_prober_list(self.exp_dir, self._profile_step, self._engine.model, prober_list)
 
         self._metrics_recorder = self._maybe_init_model_metrics_recorder(internal_metrics_cfg)
+
+    def _init_async_save_resources(self, *, async_hf_export: bool, async_checkpoint: bool) -> None:
+        self._async_hf_export = async_hf_export
+        self._pending_async_hf_future: Future[Path] | None = None
+        self._pending_async_hf_finalize_done: threading.Event | None = None
+        self._async_checkpoint = async_checkpoint
+        self._pending_checkpoint: Future | None = None
+        self._pending_checkpoint_finalize_done: threading.Event | None = None
+        self._async_save_monitor = AsyncSaveMonitor()
+        self._save_finalize_lock = threading.RLock()
 
     @classmethod
     def from_config(cls, config: TrainerConfig) -> Self:
@@ -674,7 +791,10 @@ class Trainer:
             strict_load=config.strict_load,
             checkpoint_interval=config.checkpoint_interval,
             checkpoint_maxkeep=config.checkpoint_maxkeep,
+            async_hf_export=config.async_hf_export,
             skip_checkpoint_validation=config.skip_checkpoint_validation,
+            patch_for_dcp_finish=config.patch_for_dcp_finish,
+            async_checkpoint=config.async_checkpoint,
             snapshot_interval=config.snapshot_interval,
             check_health_interval=config.check_health_interval,
             hf_interval=config.hf_interval,
@@ -705,32 +825,32 @@ class Trainer:
         This method executes the main training loop, iterating through the dataset and performing training steps. It
         handles data loading, forward pass, backward pass, optimization, logging, and checkpointing.
         """
+        if self._async_hf_export or self._async_checkpoint:
+            self._async_save_monitor.start()
+
         train_begin = time.time()
         time_before_get_data = time.time()
         for data_batch in self._data_iter():
-            consumed_samples = len(data_batch)
             time_before_train_step = time.time()
 
             ProberList.set_step(self._cur_step + 1)
             DEVICE_MODULE.reset_peak_memory_stats()
 
-            engine_input = self._prepare_model_input(data_batch)
-
             with self._maybe_profiling():
+                engine_input = self._prepare_model_input(data_batch)
                 train_step_info = self._engine.train_step(engine_input)
+                hooks = self.hooks_config.get_hooks(HookStage.AFTER_TRAIN_STEP)
+                for hook in hooks:
+                    hook(
+                        train_step_info=train_step_info,
+                        step=self.cur_step,
+                        epoch=self._cur_epoch,
+                        total_step=self.total_step,
+                        total_epoch=self.total_epoch,
+                    )
 
-            hooks = self.hooks_config.get_hooks(HookStage.AFTER_TRAIN_STEP)
-            for hook in hooks:
-                hook(
-                    train_step_info=train_step_info,
-                    step=self.cur_step,
-                    epoch=self._cur_epoch,
-                    total_step=self.total_step,
-                    total_epoch=self.total_epoch,
-                )
-
-            grad_norm = self._engine.clip_grad_norm(do_clip=self._do_clip, dtype=self._grad_norm_dtype)
-            self._engine.step_optimizer(grad_norm)
+                grad_norm = self._engine.clip_grad_norm(do_clip=self._do_clip, dtype=self._grad_norm_dtype)
+                self._engine.step_optimizer(grad_norm)
 
             time_after_train_step = time.time()
             ProberList.after_step()
@@ -741,17 +861,14 @@ class Trainer:
             internal_metrics = self._maybe_pop_model_internal_metrics(engine_input)
 
             self._cur_step += 1
-            reduced_step_consumed_tokens = self._reduce_number_across_rank(train_step_info["step_consumed_tokens"])
-            self._total_consumed_tokens += reduced_step_consumed_tokens
-            self._exp_consumed_tokens += reduced_step_consumed_tokens
-            self._total_consumed_samples += self._reduce_number_across_rank(consumed_samples)
+            step_tokens = train_step_info["step_consumed_tokens"]
+            self._local_total_consumed_tokens += step_tokens
             self._train_time = time_after_train_step - train_begin
 
             # Compute training metrics
             training_metrics = self._compute_performance_metrics(
-                local_step_consumed_tokens=train_step_info["step_consumed_tokens"],
+                local_step_consumed_tokens=step_tokens,
                 local_step_consumed_img_tokens=train_step_info.get("step_consumed_img_tokens"),
-                step_consumed_tokens=reduced_step_consumed_tokens,
                 step_time=step_time,
             )
 
@@ -777,35 +894,44 @@ class Trainer:
             if self.cur_step % 50 == 0:
                 gc.collect()
 
+        if self._async_hf_export:
+            self._wait_for_pending_async_hf()
+            self._engine.model.destroy_async_hf_resources()
+
+        if self._async_checkpoint:
+            self._wait_for_pending_checkpoint()
+            self._engine.destroy_async_checkpoint_pg()
+
         # TODO: Should use flush rather than close
+        if self._async_hf_export or self._async_checkpoint:
+            self._async_save_monitor.stop()
         self._exp_tracker.close()
         if self._metrics_recorder:
             self._metrics_recorder.close()
-        self.logger.info(f"Training finished in {time.time() - train_begin:.2f} seconds")
+        log_rank0.info(f"Training finished in {time.time() - train_begin:.2f} seconds")
+        dist.barrier()
 
     def _prepare_model_input(self, data_batch) -> list[ModelItem]:
-        loss_cfg: CELossConfig = self.loss_cfg
         seq_ctx_list: list[SequenceContext] = []
-        loss_ctx_list: list[CELossContext] = []
 
+        # 1. Extract seq_ctx
         for data in data_batch:
-            seq_ctx = data.pop("seq_ctx").to(DEVICE)
+            seq_ctx = data["seq_ctx"].to(DEVICE)
             if self.sp_mesh.size() > 1:
                 seq_ctx = seq_ctx.split(sequence_parallel_mesh=self.sp_mesh)
             seq_ctx_list.append(seq_ctx)
-            loss_ctx = loss_cfg.build(shifted_labels=data["shifted_labels"], sp_mesh=self.sp_mesh)
-            loss_ctx_list.append(loss_ctx)
+
+        # 2. Compute cu_seq_lens_list (for calibration)
+        # 3. Call model's interface to build and calibrate all loss_ctx (done in one shot)
+        loss_ctx_dict_list = self._engine.model.build_loss_ctx_batch(data_batch, sp_mesh=self.sp_mesh)
 
         # TODO: Consider moving data_batch deletion to the caller for better memory management.
         del data_batch
 
-        cu_seq_lens_list = [seq_ctx.cu_seq_lens_q for seq_ctx in seq_ctx_list]
-        loss_ctx_list = CELossContext.build_batches(
-            loss_ctx_list, cu_seq_lens_list=cu_seq_lens_list, sp_mesh=self.sp_mesh
-        )
-
+        # 4. Return ModelItem
         engine_input = [
-            ModelItem(seq_ctx=seq_ctx, loss_ctx=loss_ctx) for seq_ctx, loss_ctx in zip(seq_ctx_list, loss_ctx_list)
+            ModelItem(seq_ctx=seq_ctx, loss_ctx=loss_ctx_dict)
+            for seq_ctx, loss_ctx_dict in zip(seq_ctx_list, loss_ctx_dict_list)
         ]
         return engine_input
 
@@ -939,7 +1065,7 @@ class Trainer:
         log_level = os.environ.get("XTUNER_LOG_LEVEL", "INFO").upper()
         logger = get_logger()
         logger.remove()
-        logger.add(log_dir / f"rank{get_rank()}.log", format=log_format(), backtrace=True, catch=True)
+        logger.add(log_dir / f"rank{get_rank()}.log", format=log_format(), backtrace=True, catch=True, level="DEBUG")
         # Set log level to hide debug output
         logger.add(sys.stderr, format=log_format(rank=get_rank()), level=log_level)
         return logger, log_dir
@@ -1021,8 +1147,8 @@ class Trainer:
         if model_path is not None:
             engine.model.set_hf(model_path)
 
-        if engine.model.compile_cfg is not None and self.rank == 0:
-            logger.info(f"The `compile_cfg` of model is {json.dumps(engine.model.compile_cfg, indent=4)}")
+        if engine.model.compile_cfg is not None:
+            log_rank0.info(f"The `compile_cfg` of model is {json.dumps(engine.model.compile_cfg, indent=4)}")
         return engine
 
     def build_lr_scheduler(self, lr_cfg: LRConfig, scheduler_step: int) -> torch.optim.lr_scheduler.LRScheduler:
@@ -1077,7 +1203,22 @@ class Trainer:
         ):
             if not check_health():
                 raise RuntimeError("Health check failed, exit training")
-            logger.info(f"Health check passed at step {self.cur_step}")
+            log_rank0.info(f"Health check passed at step {self.cur_step}")
+
+    def _wait_for_pending_checkpoint(self) -> None:
+        if self._pending_checkpoint is None:
+            return
+
+        future = self._pending_checkpoint
+        finalize_done = self._pending_checkpoint_finalize_done
+        self._pending_checkpoint = None
+        self._pending_checkpoint_finalize_done = None
+
+        # Trainer owns pending async DCP state. AsyncSaveMonitor only observes
+        # the registered future and must not mutate this pending field.
+        wait([future])
+        if finalize_done is not None:
+            finalize_done.wait()
 
     def _maybe_save(self, is_snapshot: bool = False) -> bool:
         ckp_interval = self._checkpoint_interval if not is_snapshot else self._snapshot_interval
@@ -1096,22 +1237,39 @@ class Trainer:
         checkpoint_path = self._get_checkpoint_path(epoch=self._cur_epoch, step=self.cur_step, is_snapshot=is_snapshot)
         checkpoint_path.mkdir(parents=True, exist_ok=True)
 
+        # Ensure at most one async checkpoint is in flight.
+        self._wait_for_pending_checkpoint()
+
         meta_path = self.work_dir / self._META_PATH
 
-        optimizer_path = checkpoint_path / self._SAVE_OPTIMIZER_DIR
-        model_path = checkpoint_path / self._SAVE_MODEL_DIR
+        weights_path = checkpoint_path / self._SAVE_WEIGHTS_DIR
         dataloader_path = checkpoint_path / self._SAVE_DATALOADER_DIR
         scheduler_path = checkpoint_path / self._SAVE_SCHEDULER_DIR
         train_state_path = checkpoint_path / self._SAVE_TRAIN_STATE_PATH
 
-        # Save model and optimizer
-        self._engine.save_dcp(
-            model_dir=model_path,
-            optimizer_dir=optimizer_path,
+        total_consumed_tokens = (
+            self._reduce_number_across_rank(self._local_total_consumed_tokens) + self._init_total_tokens
         )
+
+        if self.cur_step % ckp_interval == 0:
+            DEVICE_MODULE.empty_cache()
+
+        # Save model and optimizer
+        async_dcp_future: Future | None = None
+        if self._async_checkpoint:
+            async_dcp_future = self._engine.async_save_dcp(weights_dir=weights_path)
+            self._register_async_save_future(
+                "async_dcp",
+                async_dcp_future,
+                weights_path,
+            )
+        else:
+            self._engine.save_dcp(weights_dir=weights_path)
 
         # Save dataloader
         self._save_dataloader(dataloader_path)
+
+        DEVICE_MODULE.empty_cache()
 
         # Save scheduler
         if self.rank == 0:
@@ -1123,11 +1281,11 @@ class Trainer:
             # TODO: Maybe we need a better way to serialize and deserialize config, rather than using pickle
             config_path = checkpoint_path / "trainer_config.json"
             config_bin = checkpoint_path / "trainer_config.bin"
-            with config_path.open("w") as f:
-                f.write(self._trainer_cfg.model_dump_json(indent=2))
+            with config_path.open("w") as config_file:
+                config_file.write(self._trainer_cfg.model_dump_json(indent=2))
 
-            with config_bin.open("wb") as f:
-                pickle.dump(self._trainer_cfg, f)
+            with config_bin.open("wb") as config_bin_file:
+                pickle.dump(self._trainer_cfg, config_bin_file)
 
         dist.barrier()
 
@@ -1139,38 +1297,88 @@ class Trainer:
                         {
                             "cur_step": self.cur_step,
                             "cur_epoch": self._cur_epoch,
-                            "total_consumed_samples": self._total_consumed_samples,
-                            "total_consumed_tokens": self._total_consumed_tokens,
+                            "total_consumed_tokens": total_consumed_tokens,
                             "train_time_offset": self._train_time + self._train_time_offset,
                         }
                     )
                 )
 
-        # Update meta
-        current_exp = self.meta.latest_exp
-        ckp_list = current_exp.checkpoint_list if not is_snapshot else current_exp.snap_checkpoint_list
-        ckp_list.append(str(checkpoint_path))
-        current_exp.cur_step = self.cur_step
-        current_exp.cur_epoch = self._cur_epoch
-        current_exp.consumed_samples = int(self._total_consumed_samples)
-        current_exp.consumed_tokens = int(self._total_consumed_tokens)
-        current_exp.history[-1]["end"] = self.cur_step
+        if self._async_checkpoint:
+            assert async_dcp_future is not None
+            future = async_dcp_future
+            finalize_done = threading.Event()
+            save_step = self.cur_step
+            save_epoch = self._cur_epoch
+            save_total_consumed_tokens = int(total_consumed_tokens)
 
-        # Delete checkpoints and update meta's checkpoint_list
-        ckp_maxkeep = self._checkpoint_maxkeep if not is_snapshot else 1
-        if ckp_maxkeep is not None and ckp_maxkeep > 0 and len(ckp_list) > ckp_maxkeep:
-            ckp_pop_num = len(ckp_list) - ckp_maxkeep
-            for _ in range(ckp_pop_num):
-                deleted_ckp = ckp_list.pop(0)
-                if self.rank == 0 and Path(deleted_ckp).exists():
-                    rmtree(deleted_ckp)
+            def finalize_dcp_save(done_future: Future) -> None:
+                try:
+                    done_future.result()
+                    self._finalize_dcp_save(
+                        checkpoint_path=checkpoint_path,
+                        meta_path=meta_path,
+                        is_snapshot=is_snapshot,
+                        step=save_step,
+                        epoch=save_epoch,
+                        total_consumed_tokens=save_total_consumed_tokens,
+                        barrier_before_hooks=False,
+                    )
+                finally:
+                    finalize_done.set()
 
-        # Save meta, must after deleting checkpoints to ensure the checkpoint_list is updated in the meta file
-        if self.rank == 0:
-            with meta_path.open("w") as f:
-                f.write(self.meta.model_dump_json(indent=2))
+            future.add_done_callback(finalize_dcp_save)
+            self._pending_checkpoint = future
+            self._pending_checkpoint_finalize_done = finalize_done
+            return True
+        else:
+            self._finalize_dcp_save(
+                checkpoint_path=checkpoint_path,
+                meta_path=meta_path,
+                is_snapshot=is_snapshot,
+                step=self.cur_step,
+                epoch=self._cur_epoch,
+                total_consumed_tokens=int(total_consumed_tokens),
+                barrier_before_hooks=True,
+            )
+            return True
 
-        dist.barrier()
+    def _finalize_dcp_save(
+        self,
+        *,
+        checkpoint_path: Path,
+        meta_path: Path,
+        is_snapshot: bool,
+        step: int,
+        epoch: int,
+        total_consumed_tokens: int,
+        barrier_before_hooks: bool,
+    ) -> None:
+        with self._save_finalize_lock:
+            # Update meta
+            current_exp = self.meta.latest_exp
+            ckp_list = current_exp.checkpoint_list if not is_snapshot else current_exp.snap_checkpoint_list
+            ckp_list.append(str(checkpoint_path))
+            current_exp.cur_step = step
+            current_exp.cur_epoch = epoch
+            current_exp.consumed_tokens = total_consumed_tokens
+            current_exp.history[-1]["end"] = step
+
+            # Delete checkpoints and update meta's checkpoint_list
+            ckp_maxkeep = self._checkpoint_maxkeep if not is_snapshot else 1
+            if ckp_maxkeep is not None and ckp_maxkeep > 0 and len(ckp_list) > ckp_maxkeep:
+                ckp_pop_num = len(ckp_list) - ckp_maxkeep
+                for _ in range(ckp_pop_num):
+                    deleted_ckp = ckp_list.pop(0)
+                    if self.rank == 0 and Path(deleted_ckp).exists():
+                        rmtree(deleted_ckp)
+
+            # Save meta, must after deleting checkpoints to ensure the checkpoint_list is updated in the meta file
+            if self.rank == 0:
+                with meta_path.open("w") as f:
+                    f.write(self.meta.model_dump_json(indent=2))
+
+        if barrier_before_hooks:
+            dist.barrier()
 
         if is_snapshot:
             hooks = self.hooks_config.get_hooks(HookStage.AFTER_SAVE_SNAPSHOT)
@@ -1180,17 +1388,15 @@ class Trainer:
         for hook in hooks:
             hook(
                 checkpoint=checkpoint_path,
-                step=self.cur_step,
-                epoch=self._cur_epoch,
+                step=step,
+                epoch=epoch,
                 total_step=self.total_step,
                 total_epoch=self.total_epoch,
             )
 
-        return True
-
     def _save_dataloader(self, dataloader_path: Path | str):
+        dataloader_state = self._dataloader.get_state_dict()
         if self.rank == 0:
-            dataloader_state = self._dataloader.get_state_dict(self._total_consumed_samples)
             torch.save(dataloader_state, dataloader_path)
 
     @property
@@ -1236,7 +1442,6 @@ class Trainer:
     def _data_iter(self):
         data_iter = iter(self._dataloader)
         while self._cur_step < self.total_step:
-            # dist.breakpoint(skip=14)
             try:
                 data = next(data_iter)
             except StopIteration:
@@ -1256,16 +1461,15 @@ class Trainer:
 
     def _set_deterministic(self):
         if XTUNER_DETERMINISTIC:
-            logger.info("Setting deterministic algorithms")
-            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
-            torch.use_deterministic_algorithms(True, warn_only=True)
+            log_rank0.info("Setting deterministic algorithms")
+            set_deterministic()
 
     def _set_random_seed(self, seed: int):
         set_random_seed(seed)
 
     def _try_bind_numa(self):
         if str(DEVICE) != "cuda":
-            logger.info("Current device is not cuda, skip numa binding.")
+            log_rank0.info("Current device is not cuda, skip numa binding.")
             return
 
         try:
@@ -1303,7 +1507,7 @@ class Trainer:
             if torch.accelerator.current_accelerator().type == "cuda":
                 backend = "cpu:gloo,cuda:nccl"
             elif torch.accelerator.current_accelerator().type == "npu":
-                backend = "cpu:gloo,npu:hccl"
+                backend = "npu:hccl"
             else:
                 raise NotImplementedError
 
@@ -1319,6 +1523,7 @@ class Trainer:
         dist.all_reduce(warmup_tensor)
 
     def _init_xtuner_meta(self, work_dir: Path, auto_resume: bool) -> XTunerMeta:
+        # TODO: simplify with XTunerMeta.build() of dist version
         if not work_dir.exists():
             if self.rank == 0:
                 work_dir.mkdir(parents=True, exist_ok=True)
@@ -1423,7 +1628,6 @@ class Trainer:
         self,
         local_step_consumed_tokens: int,
         local_step_consumed_img_tokens: int | None,
-        step_consumed_tokens: int,
         step_time: float,
     ) -> PerformanceStatistics:
         """Compute training metrics including tokens and throughput statistics.
@@ -1431,21 +1635,24 @@ class Trainer:
         Args:
             local_step_consumed_tokens (int): Tokens consumed in current step on current rank.
             local_step_consumed_img_tokens (int | None): Image tokens consumed in current step on current rank.
-            step_consumed_tokens (int): Total tokens consumed in current step across all ranks.
             step_time (float): Time spent on current training step in seconds.
 
         Returns:
             TrainingMetrics: Dictionary containing computed training metrics.
         """
         e2e_train_time = self._train_time + self._train_time_offset
-        total_consumed_tokens_per_rank = self._total_consumed_tokens / self.world_size
 
         tgs = local_step_consumed_tokens / step_time
-        e2e_tgs = total_consumed_tokens_per_rank / e2e_train_time
-        exp_tgs = self._exp_consumed_tokens / self.world_size / self._train_time
+        approximate_total_consumed_tokens = (
+            self._init_total_tokens + self._local_total_consumed_tokens * self.world_size
+        )
+        # TODO: approximate_total_consumed_tokens_per_rank could be incorrect if world_size changed.
+        #       So calculate `eta_seconds = step_time * remaining_steps` instead?
+        approximate_total_consumed_tokens_per_rank = approximate_total_consumed_tokens / self.world_size
+        exp_tgs = self._local_total_consumed_tokens / self._train_time if self._train_time > 0 else 0.0
 
         remaining_steps = self.total_step - self.cur_step
-        avg_tokens_per_step = total_consumed_tokens_per_rank / self.cur_step
+        avg_tokens_per_step = approximate_total_consumed_tokens_per_rank / self.cur_step
         remaining_tokens = remaining_steps * avg_tokens_per_step
         eta_seconds = remaining_tokens / max(tgs, 1)
         eta_hms = str(timedelta(seconds=int(eta_seconds)))
@@ -1453,11 +1660,9 @@ class Trainer:
         return PerformanceStatistics(
             local_step_consumed_tokens=local_step_consumed_tokens,
             local_step_consumed_img_tokens=local_step_consumed_img_tokens,
-            step_consumed_tokens=step_consumed_tokens,
-            total_consumed_tokens=self._total_consumed_tokens,
-            total_consumed_tokens_per_rank=total_consumed_tokens_per_rank,
+            local_total_consumed_tokens=self._local_total_consumed_tokens,
+            approximate_total_consumed_tokens=approximate_total_consumed_tokens,
             tgs=tgs,
-            e2e_tgs=e2e_tgs,
             exp_tgs=exp_tgs,
             eta_seconds=eta_seconds,
             eta_hms=eta_hms,
@@ -1476,7 +1681,7 @@ class Trainer:
         """Log the training step information.
 
         Args:
-            loss_log (LossLog): Loss values for the current step.
+            train_step_info (TrainStepInfo): Info returned per engine train_step.
             training_metrics (TrainingMetrics): Computed training metrics including tokens and throughput.
             grad_norm (float): Gradient norm value.
             data_time (float): Time spent loading data in seconds.
@@ -1512,8 +1717,7 @@ class Trainer:
             f"Epoch {self._cur_epoch} Step {self.cur_step}/{self.total_step} "
             f"data_time: {data_time:.4f} lr: {lr:.6e} time: {step_time:.4f} "
             f"text_tokens: {training_metrics['local_step_consumed_tokens']} {img_tokens_str}"
-            f"step_consumed_tokens: {training_metrics['step_consumed_tokens']} "
-            f"total_consumed_tokens: {training_metrics['total_consumed_tokens']} "
+            f"approximate_total_consumed_tokens: {training_metrics['approximate_total_consumed_tokens']} "
             f"{loss_log_str} "
             f"{data_info_str} "
             f"{extra_info_str} "
@@ -1522,7 +1726,6 @@ class Trainer:
             f"reserved_memory: {reserved_memory / (1024**3):.2f} GB "
             f"tgs: {training_metrics['tgs']:.1f} "
             f"exp_tgs: {training_metrics['exp_tgs']:.1f} "
-            f"e2e_tgs: {training_metrics['e2e_tgs']:.1f} "
             f"eta: {training_metrics['eta_hms']} "
         )
 
@@ -1533,11 +1736,11 @@ class Trainer:
             "time/train_time": round(self._train_time, 4),
             "time/eta_seconds": round(training_metrics["eta_seconds"], 1),
             "runtime_info/text_tokens": training_metrics["local_step_consumed_tokens"],
-            "runtime_info/step_consumed_tokens": training_metrics["step_consumed_tokens"],
-            "runtime_info/total_consumed_tokens": training_metrics["total_consumed_tokens"],
+            "runtime_info/approximate_total_consumed_tokens": training_metrics["approximate_total_consumed_tokens"],
             "runtime_info/tgs": training_metrics["tgs"],
             "runtime_info/exp_tgs": training_metrics["exp_tgs"],
-            "runtime_info/e2e_tgs": training_metrics["e2e_tgs"],
+            "runtime_info/efficient_attn_ratio": train_step_info["efficient_attn_ratio"],
+            "runtime_info/img_efficient_attn_ratio": train_step_info["img_efficient_attn_ratio"],
             "memory/max_memory_GB": round(max_memory / (1024**3), 3),
             "memory/reserved_memory_GB": round(reserved_memory / (1024**3), 3),
             "grad_norm": grad_norm,
@@ -1558,37 +1761,104 @@ class Trainer:
             return
 
         save_hf_path = self.exp_dir / f"hf-{self.cur_step}"
+        if self._async_hf_export:
+            self._wait_for_pending_async_hf()
+            future = self._engine.async_save_hf(hf_dir=str(save_hf_path))
+            finalize_done = threading.Event()
+            save_step = self.cur_step
+            save_epoch = self._cur_epoch
+            self._register_async_save_future("async_hf", future, save_hf_path)
+
+            def finalize_hf_save(done_future: Future[Path]) -> None:
+                try:
+                    finalized_hf_path = done_future.result()
+                    self._finalize_hf_save(
+                        finalized_hf_path,
+                        step=save_step,
+                        epoch=save_epoch,
+                        delete_hf_dirs=True,
+                    )
+                finally:
+                    finalize_done.set()
+
+            future.add_done_callback(finalize_hf_save)
+            self._pending_async_hf_future = future
+            self._pending_async_hf_finalize_done = finalize_done
+            return
+        else:
+            self._engine.save_hf(str(save_hf_path))
+            self._finalize_hf_save(
+                save_hf_path,
+                step=self.cur_step,
+                epoch=self._cur_epoch,
+                delete_hf_dirs=True,
+            )
+            return
+
+    def _register_async_save_future(
+        self,
+        name: str,
+        future: Future,
+        path: Path,
+    ) -> AsyncSaveWatchItem:
+        watch_item = AsyncSaveWatchItem(
+            name=name,
+            future=future,
+            path=path,
+            step=self.cur_step,
+            epoch=self._cur_epoch,
+        )
+        self._async_save_monitor.register(watch_item)
+        return watch_item
+
+    def _wait_for_pending_async_hf(self) -> None:
+        if self._pending_async_hf_future is None:
+            return
+
+        future = self._pending_async_hf_future
+        finalize_done = self._pending_async_hf_finalize_done
+        self._pending_async_hf_future = None
+        self._pending_async_hf_finalize_done = None
+
+        # Trainer owns pending async HF state. AsyncSaveMonitor only observes
+        # the registered future and must not mutate these pending fields.
+        wait([future])
+        if finalize_done is not None:
+            finalize_done.wait()
+
+    def _finalize_hf_save(self, finalized_hf_path: Path, step: int, epoch: int, delete_hf_dirs: bool) -> None:
         latest_hf_link = self.exp_dir / "hf-latest"
+        save_hf_path = finalized_hf_path
 
-        self.meta.latest_exp.hf_checkpoint_list.append(str(save_hf_path))
+        with self._save_finalize_lock:
+            self.meta.latest_exp.hf_checkpoint_list.append(str(save_hf_path))
 
-        if self._hf_max_keep is not None and len(self.meta.latest_exp.hf_checkpoint_list) > self._hf_max_keep:
-            deleted_hf_checkpoints = self.meta.latest_exp.hf_checkpoint_list[: -self._hf_max_keep]
-            self.meta.latest_exp.hf_checkpoint_list = self.meta.latest_exp.hf_checkpoint_list[-self._hf_max_keep :]
-            for hf_dir in deleted_hf_checkpoints:
-                if self.rank == 0 and Path(hf_dir).exists():
-                    rmtree(hf_dir)
+            if self._hf_max_keep is not None and len(self.meta.latest_exp.hf_checkpoint_list) > self._hf_max_keep:
+                deleted_hf_checkpoints = self.meta.latest_exp.hf_checkpoint_list[: -self._hf_max_keep]
+                self.meta.latest_exp.hf_checkpoint_list = self.meta.latest_exp.hf_checkpoint_list[-self._hf_max_keep :]
+                for hf_dir in deleted_hf_checkpoints:
+                    if delete_hf_dirs and self.rank == 0 and Path(hf_dir).exists():
+                        rmtree(hf_dir)
 
-        self._engine.save_hf(str(save_hf_path))
-        if self.rank == 0:
-            if isinstance(self.tokenizer, (PreTrainedTokenizer, PreTrainedTokenizerFast)):
-                self.tokenizer.save_pretrained(str(save_hf_path))
-            # 将 latest_hf_link 指向 save_hf_path
-            latest_hf_link.unlink(missing_ok=True)
-            latest_hf_link.symlink_to(save_hf_path.absolute(), target_is_directory=True)
+            if self.rank == 0:
+                if isinstance(self.tokenizer, (PreTrainedTokenizer, PreTrainedTokenizerFast)):
+                    self.tokenizer.save_pretrained(str(save_hf_path))
+                # 将 latest_hf_link 指向 save_hf_path
+                latest_hf_link.unlink(missing_ok=True)
+                latest_hf_link.symlink_to(save_hf_path.absolute(), target_is_directory=True)
 
-        meta_path = self.work_dir / self._META_PATH
+            meta_path = self.work_dir / self._META_PATH
 
-        if self.rank == 0:
-            with meta_path.open("w") as f:
-                f.write(self.meta.model_dump_json(indent=2))
+            if self.rank == 0:
+                with meta_path.open("w") as f:
+                    f.write(self.meta.model_dump_json(indent=2))
 
         hooks = self.hooks_config.get_hooks(HookStage.AFTER_SAVE_HF)
         for hook in hooks:
             hook(
                 checkpoint=save_hf_path,
-                step=self.cur_step,
-                epoch=self._cur_epoch,
+                step=step,
+                epoch=epoch,
                 total_step=self.total_step,
                 total_epoch=self.total_epoch,
             )
@@ -1648,7 +1918,7 @@ class Trainer:
             pad_token_id = tokenizer.eos_token_id
 
         if not isinstance(pad_token_id, int):
-            logger.warning(
+            log_rank0.warning(
                 f"Tokenizer pad_token_id is {pad_token_id}, which is not an integer. Setting pad_token_id to 0."
             )
 
@@ -1678,7 +1948,7 @@ class Trainer:
         if dataloader_cfg.pad_token_id is None:
             dataloader_cfg.pad_token_id = pad_token_id
         elif dataloader_cfg.pad_token_id != pad_token_id:
-            logger.warning(
+            log_rank0.warning(
                 f"Dataloader pad_token_id {dataloader_cfg.pad_token_id} is different from tokenizer "
                 f"pad_token_id {pad_token_id}. Using tokenizer pad_token_id {pad_token_id}."
             )
@@ -1686,7 +1956,7 @@ class Trainer:
 
         if self._sp_size > 1:
             if dataloader_cfg.pack_to_max_length is False:
-                logger.warning(
+                log_rank0.warning(
                     "pack_to_max_length must be True when using sequence parallel. Setting pack_to_max_length to True."
                 )
                 dataloader_cfg.pack_to_max_length = True
@@ -1699,10 +1969,10 @@ class Trainer:
                 ...
             case (MoEConfig(ep_size=1), _):
                 model_cfg.ep_size = fsdp_cfg.ep_size
-                logger.warning(f"Found model ep_size 1, using fsdp ep_size {fsdp_cfg.ep_size}.")
+                log_rank0.warning(f"Found model ep_size 1, using fsdp ep_size {fsdp_cfg.ep_size}.")
             case (MoEConfig(), FSDPConfig(ep_size=1)):
                 fsdp_cfg.ep_size = model_cfg.ep_size
-                logger.warning(f"Found fsdp ep_size 1, using fsdp ep_size {fsdp_cfg.ep_size}.")
+                log_rank0.warning(f"Found fsdp ep_size 1, using fsdp ep_size {fsdp_cfg.ep_size}.")
 
         match dataloader_cfg, model_cfg:
             case DataloaderConfig(pack_to_max_length=False), XTunerBaseModelConfig(compile_cfg=value) if (
@@ -1720,6 +1990,23 @@ class Trainer:
         if resume_cfg.auto_resume:
             return True
         return auto_resume
+
+    def _resolve_model_loss_cfg(self, model_cfg: XTunerBaseModelConfig, loss_cfg: CELossConfig | None):
+        """Backward compatibility: set Trainer's loss_cfg to model's lm_loss_cfg if not already set.
+
+        Args:
+            model_cfg (XTunerBaseModelConfig): Model configuration
+            loss_cfg (CELossConfig): Loss configuration from Trainer
+        """
+        if loss_cfg is not None:
+            if hasattr(model_cfg, "text_config"):
+                model_cfg.text_config.lm_loss_cfg = loss_cfg
+            else:
+                model_cfg.lm_loss_cfg = loss_cfg
+            log_rank0.warning(
+                "Setting model_cfg.lm_loss_cfg from Trainer's loss_cfg for backward compatibility. "
+                "In the future, please set lm_loss_cfg directly in model_cfg instead of Trainer."
+            )
 
     def _resolve_load_checkpoint_cfg(
         self, auto_resume: bool, load_checkpoint_cfg: LoadCheckpointConfig
@@ -1739,26 +2026,22 @@ class Trainer:
         load_checkpoint_cfg: LoadCheckpointConfig = self._load_checkpoint_cfg
 
         if (resume_from := load_checkpoint_cfg.checkpoint_path) is None:
-            logger.info("No checkpoint to resume from.")
+            log_rank0.info("No checkpoint to resume from.")
             return
 
         if isinstance(resume_from, str):
             resume_from = Path(resume_from)
-        logger.info(f"Resume from checkpoint: {resume_from}")
+        log_rank0.info(f"Resume from checkpoint: {resume_from}")
 
         if not resume_from.exists():
             raise FileNotFoundError(f"Checkpoint path {resume_from} does not exist.")
 
-        model_path = resume_from / self._SAVE_MODEL_DIR
-        optimizer_path = (
-            resume_from / self._SAVE_OPTIMIZER_DIR
-            if load_checkpoint_cfg.load_optimizer_states or load_checkpoint_cfg.load_optimizer_args
-            else None
-        )
+        weights_path = resume_from / self._SAVE_WEIGHTS_DIR
+        if not weights_path.exists():
+            raise FileNotFoundError(f"Checkpoint at {resume_from} has no '{self._SAVE_WEIGHTS_DIR}/' directory.")
 
         self._engine.load_dcp(
-            model_dir=model_path,
-            optimizer_dir=optimizer_path,
+            weights_dir=weights_path,
             load_states=load_checkpoint_cfg.load_optimizer_states,
             load_args=load_checkpoint_cfg.load_optimizer_args,
         )
@@ -1772,13 +2055,8 @@ class Trainer:
         self._cur_epoch = train_state["cur_epoch"]
 
         if load_checkpoint_cfg.load_dataset:
-            self._total_consumed_tokens = train_state.get("total_consumed_tokens", 0)  # default 0 for BC
             self._train_time_offset = train_state["train_time_offset"]
-            # _total_consumed_samples 会影响 save dcp时 dataloader.get_state_dict的状态。
-            # 1) 如果加载 dataset，应该恢复_total_consumed_samples为checkpoint中的值。
-            # 2) 如果不加载 dataset，应该保持_total_consumed_samples为初始值0，否则如果加载上旧dataloader的total_consumed_samples
-            #    会导致存储新dataloader时 total_consumed_samples 是不正确的值。
-            self._total_consumed_samples = train_state.get("total_consumed_samples", 0)  # default 0 for BC
+            self._init_total_tokens = train_state.get("total_consumed_tokens", 0)  # default 0 for BC
 
             dataloader_path = resume_from / self._SAVE_DATALOADER_DIR
             self._resume_dataloader(dataloader_path)
@@ -1834,20 +2112,24 @@ class Trainer:
         for k, v in env.items():
             log_str += f"{k}: {v}\n"
         log_str += "=================================================="
-        logger.info(log_str)
+        log_rank0.info(log_str)
 
     def _print_training_config(self):
         if self._config is not None and self.rank == 0:
-            config_str = self._config.model_dump_json(indent=2)
+            config_str = self._config.model_dump_json(
+                indent=2,
+                # Printing `dataset_cfg` and `dataloader_cfg` would take up a huge amount of space and make
+                # the logs unreadable, so the trainer only prints the model-related configuration.
+                exclude={"dataset_cfg", "dataloader_cfg"},
+                serialize_as_any=True,
+            )
             logger.info(f"Training config: {config_str}")
 
     def _resolve_deprecate_compile_cfg(self, model_cfg: XTunerBaseModelConfig, fsdp_cfg: FSDPConfig):
-        if self.rank == 0:
-            logger.warning(
-                "FSDPConfig.torch_compile is deprecated, and will be removed in version 1.1.0. "
-                "Please use XTunerBaseModelConfig.compile_cfg to control whether to use torch.compile for the model"
-            )
+        log_rank0.warning(
+            "FSDPConfig.torch_compile is deprecated, and will be removed in version 1.1.0. "
+            "Please use XTunerBaseModelConfig.compile_cfg to control whether to use torch.compile for the model"
+        )
         if not fsdp_cfg.torch_compile:
-            if self.rank == 0:
-                logger.warning("FSDPConfig.torch_compile is set to False, setting model_cfg.compile_cfg to False.")
+            log_rank0.warning("FSDPConfig.torch_compile is set to False, setting model_cfg.compile_cfg to False.")
             model_cfg.compile_cfg = False

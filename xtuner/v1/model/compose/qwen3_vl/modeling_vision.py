@@ -1,11 +1,13 @@
+import os
 from typing import List, Callable
 from xtuner.v1.ops.act_fn import get_act_fn
 import torch.nn as nn
 import torch
+from xtuner.v1.utils.activation_offload import async_save_on_cpu
 from typing_extensions import override
 from .qwen3_vl_config import Qwen3VLVisionConfig
 from xtuner.v1.utils import XTUNER_DETERMINISTIC, get_device, get_torch_device_module, init_params
-from xtuner.v1.ops.attn_imp import attn_impl_mapping, AttnOpOutputs
+from xtuner.v1.ops.attn_imp import AttnOpOutputs, get_attn_impl_fn
 import torch.nn.functional as F
 from pathlib import Path
 from xtuner.v1.model import BaseModel
@@ -16,6 +18,7 @@ from torch.distributed.fsdp import (
     MixedPrecisionPolicy,
     fully_shard,
 )
+from math import ceil
 from transformers.models.llama.modeling_llama import repeat_kv
 from xtuner.v1.float8.float8_handler import Float8Handler
 from torch.distributed.device_mesh import init_device_mesh
@@ -27,7 +30,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import Checkpoi
 from torch.distributed.device_mesh import DeviceMesh
 from tqdm import tqdm
 from xtuner.v1.ops.comm.all_to_all import ulysses_all_to_all
-from xtuner.v1.data_proto.utils import pad_to_multiple_of, split_for_sequence_parallel
+from xtuner.v1.data_proto.utils import pad_to_max_length, split_for_sequence_parallel
 
 DEVICE = get_device()
 DEVICE_MODULE = get_torch_device_module()
@@ -80,12 +83,17 @@ class Qwen3VLVisionRotaryEmbedding(nn.Module):
 
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
+        # Mirror HF's Qwen3_5VisionRotaryEmbedding: keep `dim` and `theta` so the buffer can be
+        # rebuilt after a meta-build → `to_empty` round-trip (the init-computed `inv_freq` would
+        # otherwise be left garbage). See `DeterministicDDPTestCase.materialize_submodule`.
+        self.dim = dim
+        self.theta = theta
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, seqlen: int) -> torch.Tensor:
         seq = torch.arange(seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(seq, self.inv_freq)
+        freqs = torch.outer(seq, self.inv_freq).to(DEVICE)
         return freqs
 
 
@@ -122,9 +130,7 @@ class Qwen3VLVisionAttention(nn.Module):
         self.scale = self.head_dim ** -0.5
         self.config = config
         self.attention_dropout = 0.0
-        self.attn_impl_func: Callable[..., AttnOpOutputs] = (
-            attn_impl_mapping[config.attn_impl]  # type: ignore[assignment]
-        )
+        self.attn_impl_func: Callable[..., AttnOpOutputs] = get_attn_impl_fn(config.attn_impl)  # type: ignore[assignment]
 
     def forward(
         self,
@@ -248,15 +254,12 @@ class Qwen3VLVisionModel(BaseModel):
         self.rotary_pos_emb = self.build_rotary_embedding(config)
 
         self.blocks = nn.ModuleList([Qwen3VLVisionLayer(config) for _ in range(config.depth)])
+        self.offload_stream = torch.cuda.Stream()
 
         self.deepstack_visual_indexes = config.deepstack_visual_indexes
 
         self._hf_prefix = "model.visual."
         self._init_load_spec()
-
-    def build_rotary_embedding(self, config: Qwen3VLVisionConfig):
-        head_dim = config.hidden_size // config.num_attention_heads
-        return Qwen3VLVisionRotaryEmbedding(head_dim // 2)
 
     @torch.no_grad()
     def init_weights(self):
@@ -303,7 +306,6 @@ class Qwen3VLVisionModel(BaseModel):
         loaded_keys, unloaded_keys, missing_keys = super().from_hf(hf_path, strict)
         # If model is built on meta device, we need to rebuild rotary embedding since from_hf will not
         # load the `inv_freq` of RotaryEmbedding which is a inpersisitent buffer.
-        self.rotary_pos_emb = self.build_rotary_embedding(self.config)
         return loaded_keys, unloaded_keys, missing_keys
 
     @override
@@ -314,9 +316,6 @@ class Qwen3VLVisionModel(BaseModel):
         self.fsdp_config = fsdp_config
 
         mp_policy = MixedPrecisionPolicy(
-            param_dtype=fsdp_config.param_dtype, reduce_dtype=fsdp_config.reduce_dtype
-        )
-        decoder_layer_mp_policy = MixedPrecisionPolicy(
             param_dtype=fsdp_config.param_dtype, reduce_dtype=fsdp_config.reduce_dtype, cast_forward_inputs=False
         )
 
@@ -334,8 +333,6 @@ class Qwen3VLVisionModel(BaseModel):
             for param in self.parameters():
                 param.requires_grad = False
 
-        self.rotary_pos_emb = self.build_rotary_embedding(self.config)
-
         checkpoint_preserve_rng_state = fsdp_config.checkpoint_preserve_rng_state
         num_recompute_layers = int(len(self.blocks) * fsdp_config.vision_recompute_ratio)
         for layer_idx in tqdm(list(range(len(self.blocks))), desc="[Vision Fully Shard]"):
@@ -350,88 +347,82 @@ class Qwen3VLVisionModel(BaseModel):
 
             self.blocks[layer_idx] = layer
 
-            fully_shard(
-                layer,
+            if self.config.fully_shard:
+                self._fully_shard(
+                    mesh=self.fsdp_mesh,
+                    mp_policy=mp_policy,
+                    reshard_after_forward=True,
+                    offload_policy=CPUOffloadPolicy() if fsdp_config.cpu_offload else None,
+                    module=layer,
+                )
+
+        if self.config.fully_shard:
+            for layer_cur, layer_next in zip(self.blocks[:-1],  self.blocks[1:]):
+                layer_cur.set_modules_to_forward_prefetch([layer_next])
+
+            self._fully_shard(
                 mesh=self.fsdp_mesh,
-                mp_policy=decoder_layer_mp_policy,
+                mp_policy=mp_policy,
                 reshard_after_forward=True,
-                offload_policy=CPUOffloadPolicy()
-                if fsdp_config.cpu_offload
-                else None,
+                offload_policy=CPUOffloadPolicy() if fsdp_config.cpu_offload else None,
             )
-
-        for layer_cur, layer_next in zip(self.blocks[:-1],  self.blocks[1:]):
-            layer_cur.set_modules_to_forward_prefetch([layer_next])
-
-        fully_shard(
-            self,
-            mesh=self.fsdp_mesh,
-            mp_policy=mp_policy,
-            reshard_after_forward=True,
-            offload_policy=CPUOffloadPolicy() if fsdp_config.cpu_offload else None,
-        )
         return self
 
-    def fast_pos_embed_interpolate(self, grid_thw):
-        grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
+    # copy from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen3_vl.py#L474
+    def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        num_grid_per_side = self.num_grid_per_side
+        m_size = self.spatial_merge_size
+        hidden_dim = self.pos_embed.embedding_dim
+        device = self.pos_embed.weight.device
 
-        idx_list = [[] for _ in range(4)]
-        weight_list = [[] for _ in range(4)]
+        outputs = []
+        for t, h, w in grid_thw:
+            h_idxs = torch.linspace(0, num_grid_per_side - 1, h, dtype=torch.float32, device=device)
+            w_idxs = torch.linspace(0, num_grid_per_side - 1, w, dtype=torch.float32, device=device)
 
-        for t, h, w in zip(grid_ts, grid_hs, grid_ws):
-            h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
-            w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
+            h_floor = h_idxs.to(torch.long)
+            w_floor = w_idxs.to(torch.long)
+            h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
+            w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
 
-            h_idxs_floor = h_idxs.int()
-            w_idxs_floor = w_idxs.int()
-            h_idxs_ceil = (h_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
-            w_idxs_ceil = (w_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
+            dh = h_idxs - h_floor
+            dw = w_idxs - w_floor
 
-            dh = h_idxs - h_idxs_floor
-            dw = w_idxs - w_idxs_floor
+            # Create meshgrid view for all h, w vars
+            dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing='ij')
+            h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing='ij')
+            h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing='ij')
 
-            base_h = h_idxs_floor * self.num_grid_per_side
-            base_h_ceil = h_idxs_ceil * self.num_grid_per_side
+            # original computation of weights
+            # w00 = (1 - dh_grid) * (1 - dw_grid)
+            # w01 = (1 - dh_grid) * dw_grid
+            # w10 = dh_grid * (1 - dw_grid)
+            # w11 = dh_grid * dw_grid
+            # we reuse w11 here to avoid duplicate
+            # dh_grid * dw_grid computation
+            w11 = dh_grid * dw_grid
+            w10 = dh_grid - w11
+            w01 = dw_grid - w11
+            w00 = 1 - dh_grid - w01
 
-            indices = [
-                (base_h[None].T + w_idxs_floor[None]).flatten(),
-                (base_h[None].T + w_idxs_ceil[None]).flatten(),
-                (base_h_ceil[None].T + w_idxs_floor[None]).flatten(),
-                (base_h_ceil[None].T + w_idxs_ceil[None]).flatten(),
-            ]
+            h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
+            w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
+            h_grid_idx = h_grid * num_grid_per_side
 
-            weights = [
-                ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
-                ((1 - dh)[None].T * dw[None]).flatten(),
-                (dh[None].T * (1 - dw)[None]).flatten(),
-                (dh[None].T * dw[None]).flatten(),
-            ]
+            indices = (h_grid_idx + w_grid).reshape(4, -1)
+            weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
+            weights = weights.to(dtype=self.pos_embed.weight.dtype, device=device)
 
-            for i in range(4):
-                idx_list[i].extend(indices[i].tolist())
-                weight_list[i].extend(weights[i].tolist())
+            embeds = self.pos_embed(indices)
+            embeds *= weights
+            combined = embeds.sum(dim=0)
 
-        idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=self.pos_embed.weight.device)
-        weight_tensor = torch.tensor(
-            weight_list, dtype=self.pos_embed.weight.dtype, device=self.pos_embed.weight.device
-        )
-        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
-        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
+            combined = combined.reshape(h // m_size, m_size, w // m_size, m_size, hidden_dim)
+            combined = combined.permute(0, 2, 1, 3, 4).reshape(1, -1, hidden_dim)
+            repeated = combined.expand(t, -1, -1).reshape(-1, hidden_dim)
+            outputs.append(repeated)
 
-        patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws)])
-
-        patch_pos_embeds_permute = []
-        merge_size = self.config.spatial_merge_size
-        for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
-            pos_embed = pos_embed.repeat(t, 1)
-            pos_embed = (
-                pos_embed.view(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
-                .permute(0, 1, 3, 2, 4, 5)
-                .flatten(0, 4)
-            )
-            patch_pos_embeds_permute.append(pos_embed)
-        patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
-        return patch_pos_embeds
+        return torch.cat(outputs, dim=0)
 
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
         merge_size = self.spatial_merge_size
@@ -486,11 +477,23 @@ class Qwen3VLVisionModel(BaseModel):
                 assert pad_num % 2 == 0, f"pad_num {pad_num} must be divisible by 2."
                 pad_grid_thw = torch.tensor([[1, 2, pad_num//2]], device=grid_thw.device, dtype=grid_thw.dtype)
                 grid_thw = torch.cat((grid_thw, pad_grid_thw), dim=0)  # b, 3
+            split_size = ceil(hidden_states.shape[0] / div_num) * div_num // sequence_parallel_mesh.size()
             total_pixels = torch.prod(grid_thw, dim=1).sum()
-            hidden_states = pad_to_multiple_of(hidden_states, 0, div_num, 0)
-            assert total_pixels == hidden_states.size(0), f"total_pixels {total_pixels} must be equal to " \
-                                                          f"hidden_states seqlen {hidden_states.size(0)}. "
-            hidden_states = split_for_sequence_parallel(hidden_states, dim=0, sp_mesh=sequence_parallel_mesh)
+            assert split_size * sequence_parallel_mesh.size() == total_pixels, \
+                f"total_pixels {total_pixels} must be equal to hidden_states seqlen {hidden_states.size(0)}. "
+
+            hidden_states = split_for_sequence_parallel(
+                hidden_states,
+                dim=0,
+                sp_mesh=sequence_parallel_mesh,
+                split_size=split_size,
+            )
+            hidden_states = hidden_states.to(DEVICE)
+            hidden_states = pad_to_max_length(hidden_states, 0, split_size, 0)
+        else:
+            hidden_states = hidden_states.to(DEVICE)
+        hidden_states = hidden_states.to(torch.bfloat16)
+
 
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
@@ -519,13 +522,29 @@ class Qwen3VLVisionModel(BaseModel):
 
         deepstack_feature_lists = []
         for layer_num, blk in enumerate(self.blocks):
-            hidden_states = blk(
-                hidden_states,
-                cu_seqlens,
-                max_seqlen,
-                position_embeddings,
-                sequence_parallel_mesh
-            )
+            if int(os.getenv("VL_XTUNER_ACTIVATION_OFFLOAD", "0")) == 1:
+                with async_save_on_cpu(
+                    h2d_stream=self.offload_stream,
+                    d2h_stream=self.offload_stream,
+                    block_idx=int(layer_num),
+                    group="vision",
+                    custom_check_fn=lambda x: x.data_ptr() == hidden_states.data_ptr(),
+                ):
+                    hidden_states = blk(
+                        hidden_states,
+                        cu_seqlens,
+                        max_seqlen,
+                        position_embeddings,
+                        sequence_parallel_mesh,
+                    )
+            else:
+                hidden_states = blk(
+                    hidden_states,
+                    cu_seqlens,
+                    max_seqlen,
+                    position_embeddings,
+                    sequence_parallel_mesh,
+                )
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_feature = hidden_states
                 deepstack_feature_lists.append(deepstack_feature)

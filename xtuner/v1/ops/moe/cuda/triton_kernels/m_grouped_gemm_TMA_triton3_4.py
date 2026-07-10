@@ -13,18 +13,19 @@ SM_MARGIN = int(os.environ.get("XTUNER_SM_MARGIN", 0))
 
 def get_cuda_autotune_config():
     return [
-        triton.Config({"BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 6}, num_stages=3, num_warps=8),
+        # BLOCK_N=256, BLOCK_K=64 fits H200 shared memory; listed first for XTUNER_DETERMINISTIC.
         triton.Config({"BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 6}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 8}, num_stages=3, num_warps=8),
         triton.Config({"BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 8}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 10}, num_stages=3, num_warps=8),
         triton.Config({"BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 10}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 14}, num_stages=3, num_warps=8),
         triton.Config({"BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 14}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 18}, num_stages=3, num_warps=8),
         triton.Config({"BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 18}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 22}, num_stages=3, num_warps=8),
         triton.Config({"BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 22}, num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 6}, num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 8}, num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 10}, num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 14}, num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 18}, num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 22}, num_stages=3, num_warps=8),
     ]
 
 
@@ -406,7 +407,6 @@ if __name__ == "__main__":
                 # with record_function(f"Cutlass_record"):
                 #     backend.gmm(a, b, out_cutlass, batch_sizes, False, trans_b)
                 prof.step()
-        # breakpoint()
         # post-process, row normalization
         out_triton = row_max_normalization(out_triton)
         # out_cublas = row_max_normalization(out_cublas)

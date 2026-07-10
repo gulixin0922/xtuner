@@ -29,7 +29,9 @@ class GetCnt:
         self._block_tensor_nums = {}  # offload tensors per block
 
     def get_cnt(self, block_idx):
+        prev_block_idx = None if self._block_idx == -1 else self._block_idx
         after_block = False
+
         if block_idx > self._block_idx:
             self._block_tensor_nums[block_idx] = 1
             if block_idx != 0:
@@ -43,7 +45,7 @@ class GetCnt:
             self._block_tensor_nums = {block_idx: 1}
 
         offload_tensor_key = f"{self._block_idx}_{self._block_tensor_nums[self._block_idx] - 1}"
-        return offload_tensor_key, after_block
+        return offload_tensor_key, after_block, prev_block_idx
 
     def get_prefetch_keys(self, block_idx, tensor_idx):
         prefetch_block_idx = max((idx for idx in self._block_tensor_nums.keys() if idx < block_idx), default=None)
@@ -60,11 +62,17 @@ class GetCnt:
 
 
 class SwapTensor:
-    def __init__(self, tensor, key):
+    def __init__(self, tensor, key, tensor_cpu=None):
         self.tensor = tensor
         self.size = tensor.size()
         self.storage_size = tensor.storage().size()
-        self.tensor_cpu = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True, device="cpu")
+        # Reuse a caller-provided pinned CPU buffer when available; otherwise allocate a fresh one.
+        # Reuse is keyed externally (see OffloadManager.get_or_create_pin_memory) so the buffer
+        # survives across iterations and avoids repeated pin_memory allocations.
+        if tensor_cpu is not None:
+            self.tensor_cpu = tensor_cpu
+        else:
+            self.tensor_cpu = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True, device="cpu")
 
         self.is_slice_tensor = tensor.storage().size() != tensor.numel()
         self.stat = "device"
@@ -193,11 +201,26 @@ class OffloadManager(metaclass=SingletonMeta):
         self.items = {}
         self.check = check
         self.device_item = []
-        self.getcnt = GetCnt()
+        self.getcnt = {}
         self.may_npu_tensors = {}
+        # Cache of reusable pinned CPU buffers keyed by full_key ("{group}_{block}_{tensor_idx}").
+        # Populated only when async_save_on_cpu is constructed with reserve_pin_memory=True;
+        # buffer is reused across iterations as long as shape and dtype still match.
+        self.pin_memory_cache: dict = {}
 
-    def get_cnt(self, block_idx):
-        return self.getcnt.get_cnt(block_idx)
+    def get_cnt(self, block_idx, group="default"):
+        if group not in self.getcnt:
+            self.getcnt[group] = GetCnt()
+        return self.getcnt[group].get_cnt(block_idx)
+
+    def get_or_create_pin_memory(self, key, shape, dtype):
+        cached = self.pin_memory_cache.get(key)
+        # Shape or dtype drift (e.g. variable seqlen) invalidates the cached buffer; reallocate.
+        if cached is not None and cached.shape == shape and cached.dtype == dtype:
+            return cached
+        new_tensor = torch.empty(shape, dtype=dtype, pin_memory=True, device="cpu")
+        self.pin_memory_cache[key] = new_tensor
+        return new_tensor
 
     def assert_exist(self, key):
         if key not in self.items:
@@ -249,16 +272,17 @@ class OffloadManager(metaclass=SingletonMeta):
             self.may_npu_tensors.update({key: self.items.pop(key)})
         return act
 
-    def prefetch_get(self, block_idx, tensor_idx, h2d_stream, d2h_stream):
-        prefetch_keys = self.getcnt.get_prefetch_keys(block_idx, tensor_idx)
+    def prefetch_get(self, block_idx, tensor_idx, h2d_stream, d2h_stream, group="default"):
+        if group not in self.getcnt:
+            return
+        prefetch_keys = self.getcnt[group].get_prefetch_keys(block_idx, tensor_idx)
         for prefetch_key in prefetch_keys:
-            if self.exist(prefetch_key):
-                prefetch_swap_tensor = self.get(prefetch_key)
+            full_key = f"{group}_{prefetch_key}"
+            if self.exist(full_key):
+                prefetch_swap_tensor = self.get(full_key)
                 h2d_stream.wait_stream(d2h_stream)
                 prefetch_swap_tensor.prefetch_launch_h2d(h2d_stream, True)
                 # prefetch_swap_tensor.tensor.record_stream(h2d_stream)
-            else:
-                torch.distributed.breakpoint()
 
     def empty(self):
         return len(self.items) == 0
@@ -291,9 +315,11 @@ class async_save_on_cpu(saved_tensors_hooks):
         h2d_stream: torch.cuda.Stream,
         d2h_stream: torch.cuda.Stream,
         block_idx: int,
-        depth: int,
+        depth: int | None = None,
+        group: str = "default",
         custom_check_fn=None,
         prefetch=True,
+        reserve_pin_memory: bool = False,
     ) -> None:
         def _pack_to_cpu(tensor):
             if not base_check_fn(tensor):
@@ -302,19 +328,28 @@ class async_save_on_cpu(saved_tensors_hooks):
             if (custom_check_fn is not None) and (not custom_check_fn(tensor)):
                 return tensor
 
-            key, after_block = OffloadManager().get_cnt(block_idx)
+            key, after_block, prev_block_idx = OffloadManager().get_cnt(block_idx, group=group)
 
-            if after_block:
-                OffloadManager().del_npu_tensor(f"{block_idx - 1}_", d2h_stream)
+            if after_block and (prev_block_idx is not None):
+                OffloadManager().del_npu_tensor(f"{group}_{prev_block_idx}_", d2h_stream)
 
-            swap_tensor = SwapTensor(tensor, key)
+            full_key = f"{group}_{key}"
+            # When reserve_pin_memory is enabled, reuse the pinned CPU buffer that was
+            # allocated for the same (group, block, tensor_idx) in a previous iteration.
+            cached_cpu = (
+                OffloadManager().get_or_create_pin_memory(full_key, tensor.shape, tensor.dtype)
+                if reserve_pin_memory
+                else None
+            )
+            swap_tensor = SwapTensor(tensor, key, tensor_cpu=cached_cpu)
 
-            if block_idx <= depth - 1:
+            should_offload = depth is None or block_idx <= depth - 1
+            if should_offload:
                 working_stream = torch.cuda.current_stream()
                 d2h_stream.wait_stream(working_stream)
                 swap_tensor.launch_d2h(d2h_stream)
 
-            OffloadManager().put(key, swap_tensor)
+            OffloadManager().put(full_key, swap_tensor)
             return swap_tensor
 
         def _unpack_from_cpu(swap_tensor) -> torch.Tensor:
@@ -328,14 +363,14 @@ class async_save_on_cpu(saved_tensors_hooks):
 
             block_idx, tensor_idx = swap_tensor.key.split("_")
 
-            OffloadManager().del_may_npu_tensor(f"{int(block_idx) + 1}_", h2d_stream)
+            OffloadManager().del_may_npu_tensor(f"{group}_{int(block_idx) + 1}_", h2d_stream)
             swap_tensor.launch_h2d(h2d_stream, True, working_stream)
             # if block_idx in ["0", "2", "3"]:
             # if block_idx in ["0"]:
             #     torch.cuda.synchronize()
 
             if prefetch and block_idx != 0:
-                OffloadManager().prefetch_get(int(block_idx), int(tensor_idx), h2d_stream, d2h_stream)
+                OffloadManager().prefetch_get(int(block_idx), int(tensor_idx), h2d_stream, d2h_stream, group=group)
 
             # if block_idx in ["0"] and tensor_idx == "1":
             #     swap_tensor.load()

@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 
+import copy
 import os
 import time
 from itertools import chain
@@ -13,7 +14,7 @@ from transformers import PreTrainedTokenizer
 from xtuner.v1.data_proto.messages import ChatMessages
 from xtuner.v1.data_proto.templates import CHAT_TEMPLATE_MAP, HybridChatTemplate
 from xtuner.v1.model import InternS1BaseConfig, InternVLBaseConfig
-from xtuner.v1.utils import get_logger
+from xtuner.v1.utils import get_logger, log_rank0
 
 from ..data_item import CacheItem, InternS1DataItem
 from ..utils import apply_exif_orientation, generate_random_int_from_dict
@@ -88,7 +89,7 @@ class InternS1VLTokenizeFunction(BaseMLLMTokenizeFunction[InternS1DataItem]):
         visual_pack_weight: float = 0.0,
         hash: str | None = None,
         only_prompt: bool = False,
-        template_name: Literal["intern-s1", "internvl-3.5"] = "intern-s1",
+        chat_template: Literal["intern-s1", "internvl-3.5"] = "intern-s1",
         debug: bool = False,
         oss_time_log_thr: int = 10,  # 10s
         add_eos_token: bool = True,  # for mllm pretrain
@@ -128,7 +129,7 @@ class InternS1VLTokenizeFunction(BaseMLLMTokenizeFunction[InternS1DataItem]):
         self.use_thumbnail = model_cfg.use_thumbnail
         self.data_name = os.path.basename(anno_name)
         self.data_augment = data_augment
-        logger.info(
+        log_rank0.info(
             f"[{self.data_name}] Using dynamic image size: {self.dynamic_image_size} and "
             f"max_dynamic_patch: {max_num} and min_dynamic_patch: {min_num} and "
             f"use_thumbnail: {self.use_thumbnail} data_aug: {self.data_augment} for training."
@@ -144,7 +145,7 @@ class InternS1VLTokenizeFunction(BaseMLLMTokenizeFunction[InternS1DataItem]):
             f"_{self.min_dynamic_patch}_{self.max_dynamic_patch}_{max_length}"
         )
 
-        self.chat_template = CHAT_TEMPLATE_MAP[template_name]
+        self.chat_template = copy.deepcopy(CHAT_TEMPLATE_MAP[chat_template])
         if system_message is not None:
             self.chat_template.default_system = system_message
 
@@ -157,7 +158,7 @@ class InternS1VLTokenizeFunction(BaseMLLMTokenizeFunction[InternS1DataItem]):
         self.add_bos_token = add_bos_token
         self.bos_token_id = None
         if self.add_bos_token and tokenizer.bos_token is None:
-            logger.warning("tokenizer has no bos_token, set add_bos_token=False")
+            log_rank0.warning("tokenizer has no bos_token, set add_bos_token=False")
             self.add_bos_token = False
         if self.add_bos_token:
             self.bos_token_id = tokenizer.convert_tokens_to_ids(tokenizer.bos_token)
@@ -558,7 +559,7 @@ class InternS1VLTokenizeFnConfig(BaseMLLMTokenizeFnConfig):
     max_num_frames: int = 24
     data_augment: bool = False
     oss_loader_cfg: OSSLoaderConfig | None = None
-    template_name: Literal["intern-s1", "internvl-3.5"] = "intern-s1"
+    chat_template: Literal["intern-s1", "internvl-3.5"] = "intern-s1"
 
     def build(
         self, tokenizer, tokenizer_hash: str | None = None, anno_name: str = "", **kwargs
@@ -576,7 +577,7 @@ class InternS1VLTokenizeFnConfig(BaseMLLMTokenizeFnConfig):
             min_num_frames=self.min_num_frames,
             max_num_frames=self.max_num_frames,
             oss_loader_cfg=self.oss_loader_cfg,
-            template_name=self.template_name,
+            chat_template=self.chat_template,
             llm_pack_weight=self.llm_pack_weight,
             visual_pack_weight=self.visual_pack_weight,
             hash=self.hash,

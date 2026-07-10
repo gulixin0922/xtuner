@@ -7,10 +7,9 @@ from torch.testing._internal.common_distributed import DistributedTestBase
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from xtuner.v1.rl.grpo import GRPOLossConfig, GRPOLossContext
+from xtuner.v1.rl.loss import GRPOLossConfig, GRPOLossContext, kl_penalty
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.rl.utils import gather_logprobs
-from xtuner.v1.rl.loss_fn import kl_penalty
 from xtuner.v1.utils.test_utils import init_data_mesh
 
 
@@ -147,7 +146,7 @@ class TestGRPOLoss(DistributedTestBase):
             if sp_size > 1:
                 seq_ctx = seq_ctx.split(sp_mesh)
             seq_ctx_list.append(seq_ctx)
-            loss_ctx = loss_cfg.build(shifted_labels=shifted_labels_list_rank[iter_idx], advantages=advantages_list_rank[iter_idx], sp_mesh=sp_mesh)
+            loss_ctx = loss_cfg.build(data={"shifted_labels": shifted_labels_list_rank[iter_idx], "advantages": advantages_list_rank[iter_idx]}, sp_mesh=sp_mesh)
             loss_ctx_list.append(loss_ctx)
         
         with torch.no_grad():

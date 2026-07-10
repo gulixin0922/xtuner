@@ -8,14 +8,19 @@ import numpy as np
 from transformers.models.internvl.modeling_internvl import InternVLVisionEmbeddings
 from transformers.modeling_outputs import BaseModelOutput
 
+_timm_import_error: ImportError | None = None
+
 try:
     from timm.layers import DropPath
-
-    has_timm = True
-except:
+except (ImportError, ModuleNotFoundError) as e:
     has_timm = False
+    DropPath = None
+    _timm_import_error = e
+else:
+    has_timm = True
+    _timm_import_error = None
 from tqdm import tqdm
-from xtuner.v1.utils import XTUNER_DETERMINISTIC, get_device, get_torch_device_module, init_params
+from xtuner.v1.utils import XTUNER_DETERMINISTIC, get_device, get_torch_device_module, init_params, log_rank0
 from xtuner.v1.model import BaseModel
 from xtuner.v1.config import FSDPConfig
 from .intern_s1_config import InternS1VisionConfig
@@ -36,6 +41,8 @@ from xtuner.v1.ops.others import Dropout
 from xtuner.v1.ops.act_fn import get_act_fn
 from xtuner.v1.utils import get_logger
 from xtuner.v1.module import AttnOutputs
+import os
+from xtuner.v1.utils.activation_offload import async_save_on_cpu
 
 DEVICE = get_device()
 DEVICE_MODULE = get_torch_device_module()
@@ -163,9 +170,15 @@ class InternS1VisionLayer(nn.Module):
         self.dropout = Dropout(config.hidden_dropout_prob)
 
         if drop_path_rate > 0.0:
-            assert has_timm, 'timm is not installed, please install it to use DropPath'
-        self.drop_path1 = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
-        self.drop_path2 = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
+            if not has_timm:
+                assert _timm_import_error is not None
+                raise _timm_import_error
+            assert DropPath is not None
+            self.drop_path1 = DropPath(drop_path_rate)
+            self.drop_path2 = DropPath(drop_path_rate)
+        else:
+            self.drop_path1 = nn.Identity()
+            self.drop_path2 = nn.Identity()
 
     @torch.no_grad()
     def init_weights(self):
@@ -230,6 +243,7 @@ class InternS1VisionEncoder(nn.Module):
         dpr = np.linspace(0.0, float(config.drop_path_rate), int(config.num_hidden_layers))
         self.layer = nn.ModuleList([
             InternS1VisionLayer(config, dpr[idx]) for idx in range(config.num_hidden_layers)])
+        self.offload_stream = torch.cuda.Stream()
 
     def forward(
         self,
@@ -241,8 +255,17 @@ class InternS1VisionEncoder(nn.Module):
         for i, layer_module in enumerate(self.layer):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)  # type: ignore
-
-            hidden_states = layer_module(hidden_states)
+            if int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) == 1:
+                with async_save_on_cpu(
+                    h2d_stream=self.offload_stream,
+                    d2h_stream=self.offload_stream,
+                    block_idx=int(i),
+                    group="vision",
+                    custom_check_fn=lambda x: x.data_ptr() == hidden_states.data_ptr(),
+                ):
+                    hidden_states = layer_module(hidden_states)
+            else:
+                hidden_states = layer_module(hidden_states)
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)  # type: ignore
@@ -348,13 +371,13 @@ class InternS1VisionModel(BaseModel):
         checkpoint_preserve_rng_state = fsdp_config.checkpoint_preserve_rng_state
         if not checkpoint_preserve_rng_state and self.config.drop_path_rate > 0.0:
             checkpoint_preserve_rng_state = True
-            logger.warning("When using drop_path, checkpoint_preserve_rng_state is set to True to avoid issues.")
+            log_rank0.warning("When using drop_path, checkpoint_preserve_rng_state is set to True to avoid issues.")
         if not checkpoint_preserve_rng_state and self.config.dropout > 0.0:
             checkpoint_preserve_rng_state = True
-            logger.warning(f"When using dropout[{self.config.dropout}], checkpoint_preserve_rng_state is set to True to avoid issues.")
+            log_rank0.warning(f"When using dropout[{self.config.dropout}], checkpoint_preserve_rng_state is set to True to avoid issues.")
         if not checkpoint_preserve_rng_state and self.config.attention_dropout > 0.0:
             checkpoint_preserve_rng_state = True
-            logger.warning(f"When using dropout[{self.config.attention_dropout}], checkpoint_preserve_rng_state is set to True to avoid issues.")
+            log_rank0.warning(f"When using dropout[{self.config.attention_dropout}], checkpoint_preserve_rng_state is set to True to avoid issues.")
 
         mp_policy = MixedPrecisionPolicy(
             param_dtype=fsdp_config.param_dtype, reduce_dtype=fsdp_config.reduce_dtype
@@ -393,21 +416,18 @@ class InternS1VisionModel(BaseModel):
 
             self.encoder.layer[layer_idx] = layer
 
-            fully_shard(
-                layer,
+            self._fully_shard(
                 mesh=self.fsdp_mesh,
                 mp_policy=mp_policy,
                 reshard_after_forward=True,
-                offload_policy=CPUOffloadPolicy()
-                if fsdp_config.cpu_offload
-                else None,
+                offload_policy=CPUOffloadPolicy() if fsdp_config.cpu_offload else None,
+                module=layer,
             )
 
         for layer_cur, layer_next in zip(self.encoder.layer[:-1], self.encoder.layer[1:]):
             layer_cur.set_modules_to_forward_prefetch([layer_next])
 
-        fully_shard(
-            self,
+        self._fully_shard(
             mesh=self.fsdp_mesh,
             mp_policy=mp_policy,
             reshard_after_forward=True,

@@ -1,16 +1,28 @@
 import json
 import logging
-import os
-import shutil
-import matplotlib.pyplot as plt
+
 import numpy as np
-from pathlib import Path
-from statistics import mean
+from utils.metric_report import publish_comparison_report
+
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger(__name__)
+
+MEMORY_GRADIENT_WARMUP_STEPS = 5
+MEMORY_GRADIENT_MIN_SEGMENT_LEN = 8
+MEMORY_GRADIENT_POSITIVE_RATIO = 0.65
+MEMORY_GRADIENT_MIN_SLOPE_GB = 1e-4
+MEMORY_GRADIENT_MIN_REL_DRIFT = 0.00015
+MEMORY_GRADIENT_RESUME_DROP_GB = 0.005
+
+# RL tracker lines: mini-batch logs vs per-RL-step summary (see rl_trainer._log_step).
+RL_STEP_SUMMARY_MARKER = "response/rewards/mean"
+RL_PERCENTILE_METRICS: dict[str, int] = {
+    "response/response_len/mean": 80,
+    "response/rewards/mean": 80,
+}
 
 
 def extract_value(file, metrics):
@@ -21,84 +33,131 @@ def extract_value(file, metrics):
             line = json.loads(line)
             for metric in metrics:
                 if metric in line:
-                     metric_all[metric].append(line[metric])
+                    metric_all[metric].append(line[metric])
             total_step += 1
 
     return total_step, metric_all
 
-def plot_all(case_name, check_metric, base_metrics, cur_metrics, output_root: Path):
-    metric_list = list(check_metric.keys())
-    n_plots = len(metric_list)
-    n_cols = int(np.ceil(np.sqrt(n_plots)))
-    n_rows = int(np.ceil(n_plots / n_cols))
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 4, n_rows * 3))
-    axes = np.array(axes).flatten()
 
-    for i, ax in enumerate(axes):
-        if i < n_plots:
-            x_base = np.arange(len(base_metrics[metric_list[i]]))
-            x_current = np.arange(len(cur_metrics[metric_list[i]]))
-            ax.plot(
-                x_base,
-                base_metrics[metric_list[i]],
-                "r--",
-                label="Base",
-                marker="x",
-                markersize=4,
-            )
-            ax.plot(
-                x_current,
-                cur_metrics[metric_list[i]],
-                "b-",
-                label="Current",
-                marker="o",
-                markersize=4,
-            )
-            ax.set_title(f"{metric_list[i].replace('/', '_')}_comparison")
-            ax.set_xlabel("Step")
-            ax.set_ylabel("Value")
-            ax.legend()
-            ax.grid(True, linestyle="--", alpha=0.7)
+def extract_rl_value(file, metrics):
+    """Extract metrics from RL step-summary lines only (ignore mini-batch
+    rows)."""
+    metric_all = {metric: [] for metric in metrics}
+    total_step = 0
+    with open(file) as f:
+        for line in f:
+            record = json.loads(line)
+            if RL_STEP_SUMMARY_MARKER not in record:
+                continue
+            total_step += 1
+            for metric in metrics:
+                if metric in record:
+                    metric_all[metric].append(record[metric])
+    return total_step, metric_all
+
+
+def _step_errors(base_vals: list[float], cur_vals: list[float], method: str) -> list[float]:
+    errors: list[float] = []
+    for base_val, cur_val in zip(base_vals, cur_vals):
+        if method == "absolute":
+            errors.append(abs(cur_val - base_val))
+        elif method == "relative":
+            if abs(base_val) < 1e-10:
+                errors.append(float("inf") if abs(cur_val) > 1e-10 else 0.0)
+            else:
+                errors.append(abs(cur_val - base_val) / abs(base_val))
         else:
-            ax.axis("off")
-    fig.suptitle(f"{case_name}_metrics_comparison", fontsize=16)
-    plt.tight_layout()
-    plt.savefig(output_root / f"{case_name}_comparison.png")
-    plt.close()
+            raise ValueError(f"Unknown method: {method}")
+    return errors
 
 
-def write_to_summary(case_name, base_jsonl, cur_jsonl ):
-
-    summary_file = os.environ.get('GITHUB_STEP_SUMMARY', './tmp.md')
-    repo_owner = os.environ.get('GITHUB_REPOSITORY_OWNER', 'internlm')
-    run_id = os.environ.get('GITHUB_RUN_ID', '0')
-    with open(summary_file, 'a') as f:
-        f.write(f"## {case_name}指标比较图\n")
-        f.write('<div align="center">\n')
-        f.write(f'<img src="https://{repo_owner}.github.io/xtuner/{run_id}/{case_name}_comparison.png"\n')
-        f.write('  style="max-width: 90%; border: 1px solid #ddd; border-radius: 8px;">\n')
-        f.write('</div>\n<div align=center>\n')
-        f.write(f'<details>\n<summary><strong style="text-align: left;">📊 点击查看用例{case_name}指标数据，依次为基线、当前版本数据</strong></summary>\n\n')
-
-    for json_f in [base_jsonl, cur_jsonl]:
-        with open(json_f, 'r', encoding='utf-8') as f:
-            lines = [line.strip() for line in f if line.strip()]
-
-        md_content = '```json\n'
-        for i, line in enumerate(lines, 1):
-            md_content += f'{line}\n'
-
-        md_content += '```\n\n'
-
-        with open(summary_file, 'a', encoding='utf-8') as f:
-            f.write(md_content)
-    with open(summary_file, 'a') as f:
-        f.write('</details>\n\n')
+def _percentile_error_passes(
+    base_vals: list[float],
+    cur_vals: list[float],
+    *,
+    method: str,
+    threshold: float,
+    operator: str,
+    percentile: int,
+) -> tuple[bool, float, str]:
+    errors = _step_errors(base_vals, cur_vals, method)
+    agg_error = float(np.percentile(errors, percentile))
+    if operator == "<":
+        passed = agg_error < threshold
+    elif operator == "<=":
+        passed = agg_error <= threshold
+    else:
+        raise ValueError(f"Unknown operator: {operator}")
+    detail = f"p{percentile}={agg_error:.6f} (max={max(errors):.6f})"
+    return passed, agg_error, detail
 
 
-def check_result(case_name, base_path, cur_path, check_metric):
+def _format_rl_metric_failure(
+    metric: str,
+    *,
+    method: str,
+    operator: str,
+    threshold: float,
+    detail: str,
+) -> str:
+    return (
+        f"{metric} aggregated error does not satisfy threshold {threshold} "
+        f"(method: {method}, operator: {operator}, {detail})"
+    )
+
+
+def _split_memory_segments(values: np.ndarray) -> list[np.ndarray]:
+    if len(values) < MEMORY_GRADIENT_MIN_SEGMENT_LEN:
+        return [values]
+
+    segments: list[np.ndarray] = []
+    start = 0
+    for idx in range(1, len(values)):
+        dropped = values[idx - 1] - values[idx]
+        if dropped >= MEMORY_GRADIENT_RESUME_DROP_GB:
+            if idx - start >= MEMORY_GRADIENT_MIN_SEGMENT_LEN:
+                segments.append(values[start:idx])
+            start = idx
+    if len(values) - start >= MEMORY_GRADIENT_MIN_SEGMENT_LEN:
+        segments.append(values[start:])
+    return segments or [values]
+
+
+def detect_memory_upward_gradient(values: list[float]) -> tuple[bool, str]:
+    """Detect sustained upward memory drift (possible leak) in the current
+    run."""
+    if len(values) <= MEMORY_GRADIENT_WARMUP_STEPS + MEMORY_GRADIENT_MIN_SEGMENT_LEN:
+        return False, ""
+
+    series = np.asarray(values[MEMORY_GRADIENT_WARMUP_STEPS:], dtype=float)
+
+    for seg_idx, segment in enumerate(_split_memory_segments(series)):
+        if len(segment) < MEMORY_GRADIENT_MIN_SEGMENT_LEN:
+            continue
+
+        deltas = np.diff(segment)
+        positive_ratio = float(np.mean(deltas > 1e-4))
+        x = np.arange(len(segment))
+        slope, _ = np.polyfit(x, segment, 1)
+        mean_val = float(np.mean(segment))
+        if mean_val < 1e-10:
+            continue
+
+        relative_drift = float(slope * (len(segment) - 1) / mean_val)
+        slope_rising = slope > MEMORY_GRADIENT_MIN_SLOPE_GB
+        mostly_increasing = positive_ratio >= MEMORY_GRADIENT_POSITIVE_RATIO
+        drift_too_large = relative_drift > MEMORY_GRADIENT_MIN_REL_DRIFT
+
+        if slope_rising and mostly_increasing and drift_too_large:
+            return True, (
+                f"segment {seg_idx}: slope={slope:.6f} GB/step, "
+                f"relative_drift={relative_drift:.4f}, positive_ratio={positive_ratio:.2f}"
+            )
+    return False, ""
+
+
+def check_result(case_name, base_path, cur_path, check_metric, phase=None):
     fail_metric = {}
-    check_metric = check_metric
     metric_list = list(check_metric.keys())
     base_steps, base_metrics = extract_value(base_path, metric_list)
     cur_steps, cur_metrics = extract_value(cur_path, metric_list)
@@ -106,11 +165,7 @@ def check_result(case_name, base_path, cur_path, check_metric):
         f"current steps is not equal to base steps, current steps: {cur_steps}, base steps: {base_steps}"
     )
 
-    output_path = Path(f"../{os.environ.get('GITHUB_RUN_ID','0')}")
-    output_path.mkdir(parents=True, exist_ok=True)
-    plot_all(case_name, check_metric, base_metrics, cur_metrics, output_path)
-    shutil.copytree(output_path, f"./{os.environ['GITHUB_RUN_ID']}", dirs_exist_ok=True)
-    write_to_summary(case_name, base_path, cur_path)
+    publish_comparison_report(case_name, check_metric, base_metrics, cur_metrics, base_path, cur_path, phase=phase)
 
     for metric, threshold in check_metric.items():
         max_error = 0.0
@@ -118,15 +173,20 @@ def check_result(case_name, base_path, cur_path, check_metric):
         check_flag = True
         if metric == "runtime_info/tgs":
             if cur_steps > 10:
-                relative_errors = abs(np.array(base_metrics[metric][10:-1]) - np.array(cur_metrics[metric][10:-1])) / (
-                    np.array(base_metrics[metric][10:-1])
+                base_vals = np.array(base_metrics[metric][10:-1], dtype=float)
+                cur_vals = np.array(cur_metrics[metric][10:-1], dtype=float)
+                degradation = np.zeros_like(base_vals, dtype=float)
+                valid_base = np.abs(base_vals) >= 1e-10
+                degradation[valid_base] = np.maximum(
+                    (base_vals[valid_base] - cur_vals[valid_base]) / np.abs(base_vals[valid_base]),
+                    0.0,
                 )
-                max_error = np.percentile(relative_errors, 80)
+                max_error = float(np.percentile(degradation, 80))
                 if max_error > threshold:
-                    mean_base_metrics = f"{mean(base_metrics[metric][10:-1]):.6f}"
-                    mean_cur_metrics = f"{mean(cur_metrics[metric][10:-1]):.6f}"
                     fail_metric[metric] = (
-                        f"{metric} relative error bigger than {threshold} after 10 step, baseline: {base_metrics[metric][10:-1]}, now: {cur_metrics[metric][10:-1]}, relative error: {relative_errors}"
+                        f"{metric} degradation bigger than {threshold} after step 10, "
+                        f"baseline: {base_metrics[metric][10:-1]}, now: {cur_metrics[metric][10:-1]}, "
+                        f"degradation: {degradation.tolist()}"
                     )
                     check_flag = False
                 else:
@@ -134,10 +194,34 @@ def check_result(case_name, base_path, cur_path, check_metric):
             else:
                 logger.warning("It's meaningless to compare tgs because of the small steps.")
                 check_flag = False
+        elif metric == "memory/max_memory_GB":
+            for idx, (old, cur) in enumerate(zip(base_metrics[metric], cur_metrics[metric])):
+                if abs(old) < 1e-10:
+                    relative_error = float("inf") if abs(cur) > 1e-10 else 0.0
+                else:
+                    relative_error = round(abs(old - cur) / abs(old), 2)
+                if relative_error > max_error:
+                    max_error = relative_error
+                    max_error_idx = idx
+                if relative_error > threshold:
+                    fail_metric[metric] = (
+                        f"{metric} relative error bigger than {threshold} in {idx} steps, "
+                        f"baseline: {old:.6f}, now: {cur:.6f}, relative error: {relative_error}"
+                    )
+                    check_flag = False
+                    break
+
+            if check_flag:
+                has_gradient, gradient_info = detect_memory_upward_gradient(cur_metrics[metric])
+                if has_gradient:
+                    fail_metric[metric] = f"{metric} shows sustained upward gradient in current run, {gradient_info}"
+                    check_flag = False
         else:
             for idx, (old, cur) in enumerate(zip(base_metrics[metric], cur_metrics[metric])):
-                relative_error = round(abs(old - cur) / abs(old), 2)
-                # update max_error
+                if abs(old) < 1e-10:
+                    relative_error = float("inf") if abs(cur) > 1e-10 else 0.0
+                else:
+                    relative_error = round(abs(old - cur) / abs(old), 2)
                 if relative_error > max_error:
                     max_error = relative_error
                     max_error_idx = idx
@@ -153,52 +237,81 @@ def check_result(case_name, base_path, cur_path, check_metric):
         if check_flag:
             logger.info(f"✓ {metric} check pass，the most relative error is {max_error:.2%} in {max_error_idx} step.")
     result = not fail_metric
-    return result, f"Some metric check failed,{fail_metric}"
+    if result:
+        return result, "All metrics check passed."
+    return result, f"Some metric check failed: {fail_metric}"
 
-def check_rl_result(case_name, base_path, cur_path, assert_info):
+
+def check_rl_result(case_name, base_path, cur_path, assert_info, phase=None):
     fail_metric = {}
     check_metrics_list = assert_info["check_metrics"]
 
     metric_list = [item["metric"] for item in check_metrics_list]
 
-    base_steps, base_metrics = extract_value(base_path, metric_list)
-    cur_steps, cur_metrics = extract_value(cur_path, metric_list)
+    base_steps, base_metrics = extract_rl_value(base_path, metric_list)
+    cur_steps, cur_metrics = extract_rl_value(cur_path, metric_list)
 
-    assert (
-        cur_steps == base_steps
-    ), f"current steps is not equal to base steps, current steps: {cur_steps}, base steps: {base_steps}"
-
-    output_path = Path(f"../{os.environ.get('GITHUB_RUN_ID','0')}")
-    output_path.mkdir(parents=True, exist_ok=True)
+    assert cur_steps == base_steps, (
+        f"current RL steps is not equal to base RL steps, current steps: {cur_steps}, base steps: {base_steps}"
+    )
 
     check_metric_dict = {item["metric"]: item["threshold"] for item in check_metrics_list}
-    plot_all(case_name, check_metric_dict, base_metrics, cur_metrics, output_path)
-
-    shutil.copytree(output_path, f"./{os.environ['GITHUB_RUN_ID']}", dirs_exist_ok=True)
-    write_to_summary(case_name, base_path, cur_path)
+    publish_comparison_report(
+        case_name, check_metric_dict, base_metrics, cur_metrics, base_path, cur_path, phase=phase
+    )
 
     for config in check_metrics_list:
         metric = config["metric"]
         threshold = config["threshold"]
-        method = config["method"]  # 'absolute' or 'relative'
-        operator = config["operator"]  # '<' or '<='
+        method = config["method"]
+        operator = config["operator"]
+        percentile = config.get("aggregate")
+        if percentile is None and metric in RL_PERCENTILE_METRICS:
+            percentile = RL_PERCENTILE_METRICS[metric]
+
+        base_vals = base_metrics[metric]
+        cur_vals = cur_metrics[metric]
+        if not base_vals and not cur_vals:
+            logger.warning(f"Skip {metric}: absent in both baseline and current RL step summaries.")
+            continue
+        if len(base_vals) != len(cur_vals):
+            fail_metric[metric] = (
+                f"{metric} step count mismatch after RL step-summary extraction: "
+                f"baseline={len(base_vals)}, current={len(cur_vals)}"
+            )
+            continue
 
         max_error = 0.0
         max_error_idx = 0
         check_flag = True
 
-        for idx, (base_val, cur_val) in enumerate(
-            zip(base_metrics[metric], cur_metrics[metric])
-        ):
-            if method == "absolute":
-                error = round(abs(cur_val - base_val), 5)
-            elif method == "relative":
-                if abs(base_val) < 1e-10:
-                    error = float("inf") if abs(cur_val) > 1e-10 else 0.0
-                else:
-                    error = round(abs(cur_val - base_val) / abs(base_val), 5)
+        if percentile is not None:
+            check_flag, agg_error, detail = _percentile_error_passes(
+                base_vals,
+                cur_vals,
+                method=method,
+                threshold=threshold,
+                operator=operator,
+                percentile=int(percentile),
+            )
+            if not check_flag:
+                fail_metric[metric] = _format_rl_metric_failure(
+                    metric,
+                    method=method,
+                    operator=operator,
+                    threshold=threshold,
+                    detail=detail,
+                )
             else:
-                raise ValueError(f"Unknown method: {method}")
+                logger.info(
+                    f"✓ {metric} check passed ({detail}, method: {method}, operator: {operator}, "
+                    f"threshold: {threshold})"
+                )
+            continue
+
+        for idx, (base_val, cur_val) in enumerate(zip(base_vals, cur_vals)):
+            errors = _step_errors([base_val], [cur_val], method)
+            error = round(errors[0], 5)
 
             if error > max_error:
                 max_error = error
@@ -234,8 +347,22 @@ def check_rl_result(case_name, base_path, cur_path, assert_info):
     result = not bool(fail_metric)
     if result:
         return result, "All metrics check passed."
-    else:
-        return result, f"Some metric check failed: {fail_metric}"
+    return result, f"Some metric check failed: {fail_metric}"
+
 
 if __name__ == "__main__":
-    print(check_result("qwen3-sft", "./base/tracker.jsonl", "./current/tracker.jsonl",{"grad_norm":0.000001,"loss/reduced_llm_loss":0.000001,"lr":0,"memory/max_memory_GB":0.2,"runtime_info/tgs":0.05,"runtime_info/text_tokens":0}))
+    print(
+        check_result(
+            "qwen3-sft",
+            "./base/tracker.jsonl",
+            "./current/tracker.jsonl",
+            {
+                "grad_norm": 0.000001,
+                "loss/reduced_llm_loss": 0.000001,
+                "lr": 0,
+                "memory/max_memory_GB": 0.2,
+                "runtime_info/tgs": 0.05,
+                "runtime_info/text_tokens": 0,
+            },
+        )
+    )

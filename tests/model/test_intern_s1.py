@@ -1,9 +1,11 @@
 import os
+import unittest
+from packaging.version import Version
 
 import parametrize
 import torch
 from xtuner._testing import patch_hf_rms_norm, DeterministicDDPTestCase
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, __version__ as transformers_version
 import torch.distributed as dist
 import tempfile
 from pathlib import Path
@@ -24,6 +26,11 @@ from xtuner.v1.utils.test_utils import init_data_mesh, preprocess_intern_s1
 INTERNS1_DENSE_PATH = os.environ["INTERNS1_DENSE_PATH"]
 
 
+@unittest.skipIf(
+    Version(transformers_version) >= Version("5.0.0"),
+    "intern-s1 model is break for transformers 5.x, "
+    f"skip until model is updated. Current transformers version: {transformers_version}"
+)
 class TestInternS1(DeterministicDDPTestCase):
     @parametrize.parametrize(
         "device,tol",
@@ -64,7 +71,7 @@ class TestInternS1(DeterministicDDPTestCase):
         with torch.device("meta"):
             model_cfg = InternS1MiniConfig()
             model_cfg.compile_cfg = False
-            interns1_model = model_cfg.build().to(torch.bfloat16)
+            interns1_model = model_cfg.build()._to_device_dtype(dtype=torch.bfloat16, skip_buffers_dtype=True)
         
         interns1_model.from_hf(INTERNS1_DENSE_PATH)
         interns1_model.eval()  # avoid open drop_path
@@ -78,7 +85,7 @@ class TestInternS1(DeterministicDDPTestCase):
         
         seq_ctx_list = [seq_ctx]
         LossContext = loss_cfg.loss_ctx_cls
-        loss_ctx = loss_cfg.build(shifted_labels=shifted_labels, sp_mesh=None)
+        loss_ctx = loss_cfg.build(data={"shifted_labels": shifted_labels}, sp_mesh=None)
         loss_ctx_list = [loss_ctx]
         loss_ctx_list = LossContext.build_batches(loss_ctx_list)
         loss_ctx = loss_ctx_list[0]
@@ -87,7 +94,7 @@ class TestInternS1(DeterministicDDPTestCase):
         with torch.no_grad():
             output = interns1_model(
                 seq_ctx=seq_ctx,
-                loss_ctx=loss_ctx,
+                loss_ctx={"lm": loss_ctx},
             )
         loss = output["loss"]
         self.assertTrue(torch.allclose(loss, expected_loss.to(loss.dtype), atol=tol, rtol=tol))
@@ -162,7 +169,7 @@ class TestInternS1(DeterministicDDPTestCase):
         with torch.device("meta"):
             model_cfg = InternS1MiniConfig()
             model_cfg.compile_cfg = False
-            interns1_model = model_cfg.build().to(torch.bfloat16)
+            interns1_model = model_cfg.build()._to_device_dtype(dtype=torch.bfloat16, skip_buffers_dtype=True)
         
         interns1_model.from_hf(INTERNS1_DENSE_PATH)
         interns1_model.eval()  # avoid open drop_path
@@ -186,7 +193,7 @@ class TestInternS1(DeterministicDDPTestCase):
 
         seq_ctx_list = [seq_ctx]
         LossContext = loss_cfg.loss_ctx_cls
-        loss_ctx = loss_cfg.build(shifted_labels=shifted_labels, sp_mesh=sp_mesh)
+        loss_ctx = loss_cfg.build(data={"shifted_labels": shifted_labels}, sp_mesh=sp_mesh)
         loss_ctx_list = [loss_ctx]
         loss_ctx_list = LossContext.build_batches(loss_ctx_list)
         loss_ctx = loss_ctx_list[0]
@@ -195,7 +202,7 @@ class TestInternS1(DeterministicDDPTestCase):
         with torch.no_grad():
             output = interns1_model(
                 seq_ctx=seq_ctx,
-                loss_ctx=loss_ctx,
+                loss_ctx={"lm": loss_ctx},
             )
         loss = output["loss"]
         self.assertTrue(torch.allclose(loss, expected_loss.to(loss.dtype), atol=tol, rtol=tol))
@@ -238,7 +245,7 @@ class TestInternS1(DeterministicDDPTestCase):
         with torch.device("meta"):
             model_cfg = InternS1MiniConfig()
             model_cfg.compile_cfg = False
-            interns1_model = model_cfg.build().to(torch.bfloat16)
+            interns1_model = model_cfg.build()._to_device_dtype(dtype=torch.bfloat16, skip_buffers_dtype=True)
         
         fsdp_config = FSDPConfig(
             cpu_offload=False,
@@ -256,7 +263,7 @@ class TestInternS1(DeterministicDDPTestCase):
         seq_ctx_list = [seq_ctx]
         loss_cfg = CELossConfig()
         LossContext = loss_cfg.loss_ctx_cls
-        loss_ctx = loss_cfg.build(shifted_labels=shifted_labels, sp_mesh=None)
+        loss_ctx = loss_cfg.build(data={"shifted_labels": shifted_labels}, sp_mesh=None)
         loss_ctx_list = [loss_ctx]
         loss_ctx_list = LossContext.build_batches(loss_ctx_list)
         loss_ctx = loss_ctx_list[0]
@@ -265,7 +272,7 @@ class TestInternS1(DeterministicDDPTestCase):
         with torch.no_grad():
             output = interns1_model(
                 seq_ctx=seq_ctx,
-                loss_ctx=loss_ctx,
+                loss_ctx={"lm": loss_ctx},
             )
         loss = output["loss"]
         self.assertTrue(torch.allclose(loss, expected_loss.to(loss.dtype), atol=tol, rtol=tol))
@@ -342,7 +349,7 @@ class TestInternS1(DeterministicDDPTestCase):
             model_cfg = InternS1MiniConfig()
             if not compile:
                 model_cfg.compile_cfg = False
-            interns1_model = model_cfg.build().to(torch.bfloat16)
+            interns1_model = model_cfg.build()._to_device_dtype(dtype=torch.bfloat16, skip_buffers_dtype=True)
 
         fsdp_config = FSDPConfig(
             cpu_offload=False,
@@ -370,7 +377,7 @@ class TestInternS1(DeterministicDDPTestCase):
         seq_ctx_list = [seq_ctx]
         loss_cfg = CELossConfig()
         LossContext = loss_cfg.loss_ctx_cls
-        loss_ctx = loss_cfg.build(shifted_labels=shifted_labels, sp_mesh=sp_mesh)
+        loss_ctx = loss_cfg.build(data={"shifted_labels": shifted_labels}, sp_mesh=sp_mesh)
         loss_ctx_list = [loss_ctx]
         loss_ctx_list = LossContext.build_batches(loss_ctx_list)
         loss_ctx = loss_ctx_list[0]
@@ -379,7 +386,7 @@ class TestInternS1(DeterministicDDPTestCase):
         with torch.no_grad():
             output = interns1_model(
                 seq_ctx=seq_ctx,
-                loss_ctx=loss_ctx,
+                loss_ctx={"lm": loss_ctx},
             )
         loss = output["loss"]
         self.assertTrue(torch.allclose(loss, expected_loss.to(loss.dtype), atol=tol, rtol=tol))
@@ -394,7 +401,7 @@ class TestInternS1(DeterministicDDPTestCase):
         self.create_pg(device)
         with torch.device("meta"):
             model_cfg = InternS1MiniConfig()
-            interns1_model = model_cfg.build().to(torch.bfloat16)
+            interns1_model = model_cfg.build()._to_device_dtype(dtype=torch.bfloat16, skip_buffers_dtype=True)
 
         fsdp_config = FSDPConfig(
             tp_size=tp_size,

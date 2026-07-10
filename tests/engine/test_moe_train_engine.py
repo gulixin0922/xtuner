@@ -38,7 +38,7 @@ class TestMoEEngine(DeterministicDDPTestCase):
         "device,ep_size,sp_size",
         [
             ("cuda", 1, 1),
-            ("cuda", 1, 2),
+            ("cuda", 2, 2),
         ],
     )
     def test_moe_engine_train(self, device, ep_size, sp_size):
@@ -93,12 +93,12 @@ class TestMoEEngine(DeterministicDDPTestCase):
             seq_ctx.num_padding = pack_len
             seq_ctx_list = [seq_ctx]
             LossContext = loss_cfg.loss_ctx_cls
-            loss_ctx = loss_cfg.build(shifted_labels=labels, sp_mesh=None)
+            loss_ctx = loss_cfg.build(data={"shifted_labels": labels}, sp_mesh=None)
             loss_ctx_list = [loss_ctx]
             loss_ctx_list = LossContext.build_batches(loss_ctx_list)
             loss_ctx = loss_ctx_list[0]
             seq_ctx = seq_ctx_list[0]
-            engine_input = [ModelItem(seq_ctx=seq_ctx, loss_ctx=loss_ctx)]
+            engine_input = [ModelItem(seq_ctx=seq_ctx, loss_ctx={"lm": loss_ctx})]
             loss_log = engine.train_step(engine_input)["logs_info"]
             grad_norm = engine.clip_grad_norm()
             engine.step_optimizer(grad_norm)
@@ -184,12 +184,12 @@ class TestMoEEngine(DeterministicDDPTestCase):
             seq_ctx.num_padding = pack_len
             seq_ctx_list = [seq_ctx]
             LossContext = loss_cfg.loss_ctx_cls
-            loss_ctx = loss_cfg.build(shifted_labels=labels, sp_mesh=None)
+            loss_ctx = loss_cfg.build(data={"shifted_labels": labels}, sp_mesh=None)
             loss_ctx_list = [loss_ctx]
             loss_ctx_list = LossContext.build_batches(loss_ctx_list)
             loss_ctx = loss_ctx_list[0]
             seq_ctx = seq_ctx_list[0]
-            engine_input = [ModelItem(seq_ctx=seq_ctx, loss_ctx=loss_ctx)]
+            engine_input = [ModelItem(seq_ctx=seq_ctx, loss_ctx={"lm": loss_ctx})]
             loss_log = engine.train_step(engine_input)["logs_info"]
             grad_norm = engine.clip_grad_norm()
             engine.step_optimizer(grad_norm)
@@ -310,15 +310,15 @@ class TestMoEEngine(DeterministicDDPTestCase):
 
             engine.from_hf(load_from, strict=not tiny_model)
             dist.barrier()
-            model_dir, optimizer_dir = tmpdir / "model", tmpdir / "optimizer"
-            engine.save_dcp(model_dir=model_dir, optimizer_dir=optimizer_dir)
+            weights_dir = tmpdir / "weights"
+            engine.save_dcp(weights_dir=weights_dir)
 
             dist.barrier()
             time.sleep(1)
 
             engine2 = create_engine_from_hf(load_from, dispatcher, ep_size, tiny=tiny_model)
             engine2.init_model_weights()
-            engine2.load_dcp(model_dir=model_dir, optimizer_dir=optimizer_dir)
+            engine2.load_dcp(weights_dir=weights_dir)
             # 3. check
             # check the model state
             state_dict = engine.model.state_dict()
@@ -379,8 +379,7 @@ class TestMoEEngine(DeterministicDDPTestCase):
             temp_dir = [None]
         dist.broadcast_object_list(temp_dir, src=0)
         temp_dir = Path(temp_dir[0])
-        model_dir = temp_dir / "model"
-        optimizer_dir = temp_dir / "optimizer"
+        weights_dir = temp_dir / "weights"
         moe_cfg = Qwen3MoE30BA3Config(
             num_hidden_layers=2,
         )
@@ -394,7 +393,7 @@ class TestMoEEngine(DeterministicDDPTestCase):
             fsdp_cfg=fsdp_cfg,
         )
         engine.init_model_weights()
-        engine.save_dcp(model_dir=model_dir, optimizer_dir=optimizer_dir)
+        engine.save_dcp(weights_dir=weights_dir)
         dist.barrier()
         time.sleep(1)
 
@@ -406,15 +405,13 @@ class TestMoEEngine(DeterministicDDPTestCase):
             optim_cfg=optim_cfg2,
             fsdp_cfg=fsdp_cfg,
         )
-        engine2.load_dcp(model_dir=model_dir, optimizer_dir=optimizer_dir, load_args=False)
-        # print(f"len(engine.optimizer.state), len(engine2.optimizer.state): {len(engine.optimizer.state)}, {len(engine2.optimizer.state)}")
+        engine2.load_dcp(weights_dir=weights_dir, load_args=False)
         assert len(engine.optimizer.state) == len(engine2.optimizer.state)
         assert len(engine.optimizer.state) != 0
         for param_group in engine2.optimizer.param_groups:
-            # print(f"param_group['lr']: {param_group['lr']}")
             assert param_group['lr'] == lr2
             assert param_group['eps'] == eps2
-        
+
         lr3 = 1e-1
         eps3 = 1e-3
         optim_cfg3 = AdamWConfig(lr=lr3, eps=eps3)
@@ -423,7 +420,7 @@ class TestMoEEngine(DeterministicDDPTestCase):
             optim_cfg=optim_cfg3,
             fsdp_cfg=fsdp_cfg,
         )
-        engine3.load_dcp(model_dir=model_dir, optimizer_dir=optimizer_dir, load_states=False)
+        engine3.load_dcp(weights_dir=weights_dir, load_states=False)
         assert len(engine3.optimizer.state) == 0
         for param_group in engine3.optimizer.param_groups:
             assert param_group['lr'] == lr1

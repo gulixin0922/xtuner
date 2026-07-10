@@ -1,11 +1,13 @@
 #!/bin/bash
 export QWEN3_VL_MOE_PATH=${CI_SHARE_MODEL}/Qwen3-VL-30B-A3B-Instruct_MOE
 export QWEN3_VL_DENSE_PATH=${CI_SHARE_MODEL}/Qwen3-VL-4B-Instruct
+export QWEN3_5_DENSE_4B_PATH=${CI_SHARE_MODEL}/models--Qwen--Qwen3.5-4B
 export INTERN_VL_1B_PATH=${CI_SHARE_MODEL}/InternVL3_5-1B-HF
 export VIDEO_ROOT=${CI_SHARE_DATA}/images
 export QWEN3_4B_PATH=${CI_SHARE_MODEL}/Qwen3-4B-Instruct-2507
 export ROLLOUT_DATA_PATH=${CI_SHARE_DATA}/gsm8k/train.jsonl
 export GEO3K_TRAIN_DATA_PATH=${CI_SHARE_DATA}/geometry3k/train.jsonl
+export GEO3K_LONGTAIL_DATA_PATH=${CI_SHARE_DATA}/geometry3k/geometry3k_longtail_96.jsonl
 export GEO3K_MEDIA_ROOT=${CI_SHARE_DATA}/geometry3k/
 export DEEPSEEK_V3_PATH=${CI_SHARE_MODEL}/DeepSeek-V3.1
 export GPT_OSS_MINI_PATH=${CI_SHARE_MODEL}/gpt-oss-20b-bf16
@@ -14,6 +16,7 @@ export VERL_ROLLOUT_DATA_PATH=${CI_SHARE_DATA}/verl-rollout-step0.jsonl
 export QWEN3_PATH=${CI_SHARE_MODEL}/Qwen3-8B
 export QWEN3_VL_PATH=${CI_SHARE_MODEL}/Qwen2.5-VL-3B-Instruct
 export QWEN3_MOE_PATH=${CI_SHARE_MODEL}/Qwen3-30B-A3B
+export QWEN3_5_MOE_PATH=${CI_SHARE_MODEL}/Qwen3.5-35B-A3B
 export QWEN3_MOE_FOPE_PATH=${CI_SHARE_MODEL}/Qwen3_30B_fope_g0.1_sephead
 export INTERNS1_DENSE_PATH=${CI_SHARE_MODEL}/intern-s1-mini
 export ROLLOUT_MODEL_PATH=${CI_SHARE_MODEL}/Qwen3-8B
@@ -34,5 +37,10 @@ export DISTRIBUTED_TESTS_DEFAULT_TIMEOUT=600
 
 proxy_off
 pip install -e .[all]
+
+TORCH_VERSION=$(python -c "import torch;print(torch.__version__.split('+')[0])")
+if [[ $TORCH_VERSION == "2.9.1" ]]; then
+    pip install nvidia-cudnn-cu12==9.15.1.9
+fi
 
 export PYTHONPATH=${LM_DEPLOY}:$PYTHONPATH

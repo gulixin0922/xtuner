@@ -2,13 +2,12 @@
 import os
 import types
 from pathlib import Path
-from typing import Annotated, Literal, Self, Sequence, cast
+from typing import TYPE_CHECKING, Annotated, Literal, Self, Sequence, TypedDict, cast
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from cyclopts import Parameter
-from pydantic import BaseModel as PydanticBaseModel
 from pydantic import ConfigDict
 from torch import nn
 from torch.distributed._functional_collectives import all_reduce
@@ -18,7 +17,6 @@ from torch.distributed.distributed_c10d import ReduceOp
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
-    fully_shard,
 )
 from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
 from tqdm import tqdm
@@ -27,7 +25,18 @@ from typing_extensions import overload, override
 from xtuner.v1.config import FSDPConfig
 from xtuner.v1.data_proto import SequenceContext
 from xtuner.v1.float8.float8_handler import Float8Handler
-from xtuner.v1.loss import BalancingLoss, CELossContext, ZLoss
+from xtuner.v1.loss import (
+    AuxLossConfig,
+    AuxLossContext,
+    BalancingLossConfig,
+    BalancingLossContext,
+    BaseLossContext,
+    LMHeadLossContext,
+    MTPLossContext,
+    ZLossConfig,
+    ZLossContext,
+)
+from xtuner.v1.loss.mtp_loss import MTPLossConfig
 from xtuner.v1.model.base import (
     DEFAULT_FLOAT8_CFG,
     BaseModel,
@@ -46,16 +55,21 @@ from xtuner.v1.module import (
     NoAuxRouter,
     NoAuxRouterConfig,
     RMSNorm,
-    RotaryEmbeddingProtocol,
-    get_rope_embedding,
 )
 from xtuner.v1.module.decoder_layer.dense_decoder_layer import DenseDecoderLayer
 from xtuner.v1.module.decoder_layer.moe_decoder_layer import MoEActFnConfig, MoEBlock, MoEDecoderLayer
+from xtuner.v1.module.mtp import MTPBlock, MTPConfig, MTPLayer
 from xtuner.v1.utils import (
     get_device,
     get_logger,
+    log_rank0,
 )
 from xtuner.v1.utils.activation_offload import async_save_on_cpu
+from xtuner.v1.utils.router_offload import async_offload_to_cpu
+
+
+if TYPE_CHECKING:
+    from xtuner.v1.datasets.collator import ColateItem
 
 
 DEVICE = get_device()
@@ -88,6 +102,7 @@ class MoEModelOutputs(ModelOutputs):
     balancing_loss: torch.Tensor | None = None
     z_loss: torch.Tensor | None = None
     tokens_per_expert_global: torch.Tensor
+    mtp_loss: torch.Tensor | None = None
 
     def free_nongrad_feature(self):
         """Release large intermediate tensors not needed for backward or
@@ -100,6 +115,7 @@ class MoEModelOutputs(ModelOutputs):
         """
         super().free_nongrad_feature()
         self.router_logits = None
+        self.router_weights = None
 
 
 class MoEBatchForwardInfo(BatchForwardInfo):
@@ -109,31 +125,11 @@ class MoEBatchForwardInfo(BatchForwardInfo):
     maxvio: float
 
 
-class BalancingLossConfig(PydanticBaseModel):
-    model_config = ConfigDict(extra="forbid")
-    balancing_loss_alpha: float = 0.001
-    balancing_loss_global_average: bool = True
-
-    def build(self, router_scoring_func) -> BalancingLoss:
-        return BalancingLoss(
-            self.balancing_loss_alpha,
-            self.balancing_loss_global_average,
-            router_scoring_func=router_scoring_func,
-        )
-
-
-class ZLossConfig(PydanticBaseModel):
-    model_config = ConfigDict(extra="forbid")
-    z_loss_alpha: float = 0.001
-    z_loss_global_average: bool = True
-
-    def build(self) -> "ZLoss":
-        from xtuner.v1.loss import ZLoss
-
-        return ZLoss(
-            self.z_loss_alpha,
-            self.z_loss_global_average,
-        )
+class MoELossContextDict(TypedDict):
+    lm: BaseLossContext
+    balancing: BalancingLossContext | None
+    z_loss: ZLossContext | None
+    mtp: list[BaseLossContext] | None
 
 
 class MoEConfig(TransformerConfig):
@@ -152,9 +148,18 @@ class MoEConfig(TransformerConfig):
     z_loss_cfg: ZLossConfig | None = None
     return_router_results: bool = False
     gate_bias: bool = False
+    router_compute_dtype: Literal["float32", "native"] = "float32"
     moe_bias: bool = False
     moe_act_fn_cfg: MoEActFnConfig = MoEActFnConfig()
+    mtp_config: MTPConfig | None = None
     freeze_routers: bool = False
+    router_async_offload: bool = False
+    aux_loss_cfg: AuxLossConfig = AuxLossConfig()
+    # TODO: `FSDPConfig` should be model-specific; temporarily keep
+    # `embed_reshard_after_forward` here until per-submodule FSDP config is supported.
+    # Compose models call `self.embed_tokens` multiple times per step, so default to
+    # keeping it unsharded after forward to avoid repeated all-gathers.
+    embed_reshard_after_forward: bool = True
 
     def build(self) -> "MoE":
         from xtuner.v1.model.moe.moe import MoE
@@ -197,6 +202,7 @@ class MoE(BaseModel):
         self.layers = self.build_layers(config)
         self.rotary_emb = self.build_rotary_embedding(config)
         self.embed_tokens = self.build_embeddings(config)
+        self.mtp_block = self.build_mtp_block(config) if config.mtp_config is not None else None
 
         self.fp32_layers = [self.rotary_emb]
 
@@ -205,76 +211,67 @@ class MoE(BaseModel):
         self._init_load_spec()
         self._maybe_enable_compile(self.compile_cfg)
 
-        self.balancing_loss: BalancingLoss | None
-        self.z_loss: ZLoss | None
-        if self.config.balancing_loss_cfg is not None:
-            self.balancing_loss = self.config.balancing_loss_cfg.build(self.config.router.scoring_func)
-        else:
-            self.balancing_loss = None
-        if self.config.z_loss_cfg is not None:
-            self.z_loss = self.config.z_loss_cfg.build()
-        else:
-            self.z_loss = None
-
         self.offload_stream = torch.cuda.Stream()
-
-    def _select_non_pad_router_logits(
-        self,
-        router_logits_list: list[list[torch.Tensor]] | list[torch.Tensor],
-        attn_mask_list: list[torch.Tensor] | torch.Tensor,
-    ) -> torch.Tensor:
-        assert len(router_logits_list) > 0, "router_logits_list should not be empty"
-        if isinstance(router_logits_list[0], torch.Tensor):
-            router_logits_list = [cast(list[torch.Tensor], router_logits_list)]  # intra_layer_micro_batch is 1
-            attn_mask_list = [cast(torch.Tensor, attn_mask_list)]
-        # router_logits_list [intra_layer_micro_batch, num_layers][seq, num_experts]
-        # attn_mask_list [intra_layer_micro_batch, ][1, seq]
-        intra_layer_micro_batch = len(router_logits_list)
-        num_layers = len(router_logits_list[0])
-
-        router_logits_list_new = []  # [num_layers, intra_layer_micro_batch] -> [num_layers * intra_layer_micro_batch]
-        for layer_idx in range(num_layers):
-            for micro_batch_idx in range(intra_layer_micro_batch):
-                router_logits_list_new.append(router_logits_list[micro_batch_idx][layer_idx])
-
-        router_logits = torch.stack(
-            router_logits_list_new, dim=0
-        )  # [num_layers * intra_layer_micro_batch, seq, num_experts]
-        router_logits = router_logits.view(
-            num_layers, -1, router_logits.shape[-1]
-        )  # [num_layers, intra_layer_micro_batch * seq, num_experts]
-        attn_mask = torch.stack(attn_mask_list, dim=0)  # type: ignore  # [intra_layer_micro_batch, 1, seq]
-        attn_mask = attn_mask.flatten()
-
-        # router_logits = router_logits[:, attn_mask].contiguous().float()
-        indices = torch.nonzero(attn_mask, as_tuple=True)[0]
-        router_logits = (
-            torch.index_select(router_logits, 1, indices).contiguous().float()
-        )  # [num_layers, non_pad_seq, num_experts]
-
-        return router_logits
-
-    @torch.no_grad()
-    def _cal_tokens_per_expert(self, router_weights: torch.Tensor):
-        n_routed_experts = self.config.n_routed_experts
-        num_experts_per_tok = self.config.num_experts_per_tok
-        num_layers = router_weights.shape[0]
-        router_weights = router_weights.float()  # (nlayers, seq, ne)
-        _, selected_experts = torch.topk(router_weights, num_experts_per_tok, dim=-1)
-        selected_experts_flat = selected_experts.view(num_layers, -1)
-        offset = torch.arange(num_layers, device=router_weights.device).unsqueeze(1) * n_routed_experts
-        selected_experts_offset = selected_experts_flat + offset
-        tokens_per_expert_flat = torch.histc(
-            selected_experts_offset.view(-1),
-            bins=num_layers * n_routed_experts,
-            min=0,
-            max=num_layers * n_routed_experts,
+        self.aux_loss: AuxLossContext = self.config.aux_loss_cfg.build(
+            n_routed_experts=self.config.n_routed_experts,
+            num_experts_per_tok=self.config.num_experts_per_tok,
         )
-        tokens_per_expert = tokens_per_expert_flat.view(num_layers, n_routed_experts)  # (nlayers, ne)
-        tokens_per_expert_global = tokens_per_expert.to(torch.long)  # (nlayers, ne)
-        if dist.is_initialized():
-            tokens_per_expert_global = all_reduce(tokens_per_expert_global, "sum", dist.group.WORLD)  # type: ignore
-        return tokens_per_expert_global
+
+    def _maybe_offload_router(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.config.router_async_offload:
+            return async_offload_to_cpu(tensor, self.offload_stream)
+        return tensor
+
+    def _z_loss_dist_token_count(
+        self,
+        z_ctx: list[ZLossContext] | ZLossContext | None,
+        num_tokens_local: int,
+        device: torch.device | str | int,
+    ) -> tuple[torch.Tensor | None, int]:
+        """Compute the cross-rank non-padding token count needed by the z-loss
+        inline path.
+
+        Returns ``(num_tokens_global, world_size)``. ``num_tokens_global`` is ``None`` (i.e. skip
+        global averaging) when there is no z-loss context, when the configured z-loss is not
+        global-average, or when no process group is initialized.
+        """
+        if z_ctx is None:
+            return None, 1
+        first = z_ctx[0] if isinstance(z_ctx, list) else z_ctx
+        if not first.loss_cfg.z_loss_global_average or not dist.is_initialized():
+            return None, 1
+        n = torch.tensor(num_tokens_local, device=device, dtype=torch.int64)
+        group = dist.group.WORLD
+        assert group is not None
+        n_global = all_reduce(n, "sum", group)
+        return n_global, dist.get_world_size()
+
+    def _extract_aux_loss_ctx(
+        self,
+        loss_ctx: list[MoELossContextDict] | MoELossContextDict | None,
+    ) -> tuple[
+        list[BalancingLossContext] | BalancingLossContext | None,
+        list[ZLossContext] | ZLossContext | None,
+    ]:
+        if loss_ctx is None:
+            return None, None
+
+        if isinstance(loss_ctx, list):
+            balancing_ctx: list[BalancingLossContext] = []
+            z_ctx: list[ZLossContext] = []
+            for ctx in loss_ctx:
+                ctx_bal = ctx.get("balancing")
+                if ctx_bal is not None:
+                    balancing_ctx.append(ctx_bal)
+                ctx_z = ctx.get("z_loss")
+                if ctx_z is not None:
+                    z_ctx.append(ctx_z)
+            # Collapse empty fan-out lists to None so downstream guards
+            # (`if ctx is None`, `_z_loss_dist_token_count`, AuxLoss.accumulate fan-out)
+            # can treat "no context across any micro-batch" as the no-op case.
+            return (balancing_ctx or None), (z_ctx or None)
+
+        return loss_ctx.get("balancing"), loss_ctx.get("z_loss")
 
     @torch.no_grad()
     def update_bias(self, total_expert_counts_pre_iter, expected_loads):
@@ -304,10 +301,75 @@ class MoE(BaseModel):
 
             e_score_correction_bias.add_(updates)
 
+    def build_loss_ctx_batch(  # type: ignore[override]
+        self,
+        data_batch: list["ColateItem"],
+        sp_mesh: DeviceMesh | None = None,
+    ) -> list[MoELossContextDict]:  # type: ignore[override]
+        """Build and calibrate loss contexts for MoE model.
+
+        Args:
+            data_batch (list[dict]): All microbatch data
+            sp_mesh (DeviceMesh | None): Sequence parallel mesh
+            cu_seq_lens_list (list[torch.IntTensor] | None): For calibration
+
+        Returns:
+            list[dict]: Loss context dict for each microbatch.
+                Each dict contains:
+                - "lm": LM loss context
+                - "balancing": Balancing loss context (if configured)
+                - "z_loss": Z-loss context (if configured)
+                - "mtp": MTP loss contexts (if configured)
+
+        Note:
+            Auxiliary loss contexts are built without parameters.
+            All data is passed to forward() at runtime:
+            - balancing_ctx(router_weights, n_routed_experts, num_experts_per_tok)
+            - z_loss_ctx(router_logits)
+        """
+        # Build LM loss context
+        _data_batch: list[dict] = data_batch  # type: ignore[assignment]
+        res: list[dict] = super().build_loss_ctx_batch(_data_batch, sp_mesh)
+        cu_seq_lens_list = [data["seq_ctx"].cu_seq_lens_k for data in data_batch]
+
+        # Add auxiliary losses
+        self._add_auxiliary_loss("balancing", self.config.balancing_loss_cfg, _data_batch, res)
+        self._add_auxiliary_loss("z_loss", self.config.z_loss_cfg, _data_batch, res)
+
+        # Add MTP loss contexts if MTP is enabled
+        if self.config.mtp_config is not None:
+            for mtp_idx in range(self.config.mtp_config.num_layers):
+                mtp_loss_cfg = MTPLossConfig(
+                    **self.config.lm_loss_cfg.model_dump(),
+                    mtp_depth=mtp_idx + 1,
+                    detach_mtp_lm_head_weight=self.config.mtp_config.detach_mtp_lm_head_weight,
+                )
+                mtp_loss_ctx_list = self._build_loss_ctx(mtp_loss_cfg, _data_batch, sp_mesh)
+                if mtp_loss_ctx_list is not None:
+                    mtp_loss_ctx_list = MTPLossContext.build_batches(  # type: ignore[assignment]
+                        cast(list[MTPLossContext], mtp_loss_ctx_list),  # type: ignore[arg-type]
+                        cu_seq_lens_list=cu_seq_lens_list,
+                        sp_mesh=sp_mesh,
+                    )
+                    for i, mtp_loss_ctx in enumerate(mtp_loss_ctx_list):
+                        if "mtp" not in res[i]:
+                            res[i]["mtp"] = []
+                        res[i]["mtp"].append(mtp_loss_ctx)  # type: ignore[union-attr]
+
+            # Ensure all microbatches have mtp key
+            for loss_ctx_dict in res:
+                if "mtp" not in loss_ctx_dict:
+                    loss_ctx_dict["mtp"] = None
+        else:
+            for loss_ctx_dict in res:
+                loss_ctx_dict["mtp"] = None
+
+        return res  # type: ignore[return-value]
+
     def forward(
         self,
         seq_ctx: list[SequenceContext] | SequenceContext,
-        loss_ctx: list[CELossContext] | CELossContext | None,
+        loss_ctx: list[MoELossContextDict] | MoELossContextDict | None,
         return_router_logits: bool = False,
     ):
         # TODO: caoweihan: Recover this assertion after the refactor of LossContext
@@ -338,12 +400,8 @@ class MoE(BaseModel):
         base_info = super().post_micro_batch_forward(batch_outputs)
         logs_info = base_info["logs_info"]
 
-        tokens_per_expert_global = torch.zeros(
-            self.config.num_hidden_layers - self.config.first_k_dense_replace,
-            self.config.n_routed_experts,
-            dtype=torch.int64,
-            device=DEVICE,
-        )
+        first_tokens_per_expert = batch_outputs[0]["tokens_per_expert_global"]
+        tokens_per_expert_global = torch.zeros_like(first_tokens_per_expert)
         for output in batch_outputs:
             tokens_per_expert_global += output["tokens_per_expert_global"]
 
@@ -362,7 +420,7 @@ class MoE(BaseModel):
     def _micro_batch_forward(
         self,
         seq_ctx_list: list[SequenceContext],
-        loss_ctx_list: list[CELossContext],
+        loss_ctx_list: list[MoELossContextDict],
         return_router_logits: bool = False,
     ) -> MoEModelOutputs:
         """Micro-batch forward pass for MoE model.
@@ -381,7 +439,10 @@ class MoE(BaseModel):
         else:
             cat_input_ids = torch.cat([ctx.input_ids for ctx in seq_ctx_list], dim=1)  # type: ignore
             cat_hidden_states = self.embed_tokens(cat_input_ids)
-        cat_position_ids = torch.cat([ctx.position_ids for ctx in seq_ctx_list], dim=1)  # type: ignore
+        # M-RoPE position_ids are 3D [axes, batch, seq] for VL while text-only ones are 2D
+        # [batch, seq]; -1 selects the seq dim in both cases. Hard-coded dim=1 was a text-only
+        # assumption and produced a wrong-length cos/sin for VL under intra_layer_micro_batch.
+        cat_position_ids = torch.cat([ctx.position_ids for ctx in seq_ctx_list], dim=-1)  # type: ignore
         cat_position_embeddings = self.rotary_emb(cat_hidden_states, cat_position_ids)  # type: ignore
         position_embeddings_list = list(
             zip(
@@ -389,16 +450,28 @@ class MoE(BaseModel):
                 cat_position_embeddings[1].chunk(len(seq_ctx_list), dim=1),
             )
         )
+        cat_mask = torch.cat([ctx.mask for ctx in seq_ctx_list], dim=1)
+        # Hoisted out of the per-layer accumulate path: mask is constant across layers,
+        # so the non-pad index lookup runs once per forward instead of once per (layer, ctx).
+        nonpad_indices = torch.nonzero(cat_mask, as_tuple=True)[1]
+        non_pad_token = nonpad_indices.numel()
 
         # Initialize output containers
         output: dict = {}
 
-        router_logits_list: list[dict[str, torch.Tensor]] = [{} for _ in range(len(seq_ctx_list))]
-        router_weights_list: list[dict[str, torch.Tensor]] = [{} for _ in range(len(seq_ctx_list))]
+        # Only the logits side is ever exposed to callers in the micro-batch path; the
+        # weights side is not part of the returned schema, so we never accumulate it.
+        keep_router = self.config.return_router_results or return_router_logits
+        router_logits_list: list[dict[str, torch.Tensor]] = (
+            [{} for _ in range(len(seq_ctx_list))] if keep_router else []
+        )
+        balancing_ctx, z_ctx = self._extract_aux_loss_ctx(loss_ctx_list)
+        num_tokens_global, z_world_size = self._z_loss_dist_token_count(z_ctx, non_pad_token, cat_mask.device)
 
         # Process through layers
         cat_seq_ctx: SequenceContext | None = None
 
+        hidden_states_list: list[torch.Tensor] = []
         moe_forward = False
 
         for seq_ctx in seq_ctx_list:
@@ -426,16 +499,18 @@ class MoE(BaseModel):
                     # should be optimized in the future.
                     hidden_states_list = [i.clone() for i in cat_hidden_states.chunk(len(seq_ctx_list), dim=1)]
                     moe_forward = True
+                assert hidden_states_list, "XTuner Internal Error, found empty hidden states for domino EP"
 
                 if int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) == 1:
                     with async_save_on_cpu(
                         h2d_stream=self.offload_stream,
                         d2h_stream=self.offload_stream,
                         block_idx=layer_idx - self.config.first_k_dense_replace,
-                        depth=len(self.layers) - self.config.first_k_dense_replace,
+                        group="text",
                         custom_check_fn=lambda x: x.data_ptr()
                         in [hidden_states.data_ptr() for hidden_states in hidden_states_list],
                         prefetch=True,
+                        reserve_pin_memory=True,
                     ):
                         layer_results = decoder_layer(
                             *hidden_states_list,
@@ -452,19 +527,88 @@ class MoE(BaseModel):
                 router_logits = layer_results[len(hidden_states_list) : len(hidden_states_list) * 2]
                 router_weights = layer_results[len(hidden_states_list) * 2 :]
 
-                # Update hidden states and collect router results
+                # Update hidden states and (optionally) collect router logits.
+                # router_weights are only consumed by aux_loss.accumulate below, so we
+                # never stash them per-MB the way we do for logits.
                 for i, hidden_states in enumerate(hidden_states):
                     hidden_states_list[i] = hidden_states
-                    router_logits_list[i][f"layer{idx}"] = router_logits[i]
-                    router_weights_list[i][f"layer{idx}"] = router_weights[i]
+                    if keep_router:
+                        router_logits_list[i][f"layer{idx}"] = self._maybe_offload_router(router_logits[i])
+
+                cat_router_weights = torch.cat(router_weights, dim=0)
+                cat_router_logits = torch.cat(router_logits, dim=0)
+                # Pin the per-layer z-loss to MB0's hidden_states stream. With multiple MBs, only
+                # one carrier may be chosen — all MBs converge into the same total_loss backward,
+                # so MB0's path traverses every aux-loss node exactly once.
+                hidden_states_list[0] = self.aux_loss.accumulate(
+                    selected_router_weights=cat_router_weights.index_select(0, nonpad_indices).contiguous().float(),
+                    selected_router_logits=cat_router_logits.index_select(0, nonpad_indices).contiguous().float(),
+                    hidden_states=hidden_states_list[0],
+                    balancing_ctx=balancing_ctx,
+                    z_ctx=z_ctx,
+                    num_tokens_local=non_pad_token,
+                    num_tokens_global=num_tokens_global,
+                    world_size=z_world_size,
+                )
+
+        assert hidden_states_list, "XTuner Internal Error, found empty hidden states for domino EP"
+
+        if self.mtp_block is not None:
+            assert self.config.mtp_config is not None
+
+            # Build a per-microbatch SequenceContext clone for MTP. We always run the MTP
+            # block on every micro-batch so domino EP can overlap dispatch/combine across
+            # micro-batches at each MTP depth; per-microbatch loss aggregation below skips
+            # the ones whose loss context is absent.
+            mtp_seq_ctx_list: list[SequenceContext] = []
+            for seq_ctx in seq_ctx_list:
+                assert seq_ctx.position_ids is not None
+                mtp_seq_ctx_list.append(
+                    seq_ctx.copy(
+                        input_ids=seq_ctx.input_ids.clone() if seq_ctx.input_ids is not None else None,
+                        position_ids=seq_ctx.position_ids.clone(),
+                        inputs_embeds=seq_ctx.inputs_embeds.clone() if seq_ctx.inputs_embeds is not None else None,
+                    )
+                )
+
+            mtp_outputs_per_mb = self.mtp_block(
+                *hidden_states_list,
+                embed_tokens_fn=self.embed_tokens,
+                position_embeddings=position_embeddings_list,
+                seq_ctx=mtp_seq_ctx_list,
+            )
+
+            mtp_losses = torch.tensor(0.0, device=DEVICE)
+            has_mtp_loss = False
+            for micro_batch_idx, (loss_ctx_dict, mtp_outputs) in enumerate(zip(loss_ctx_list, mtp_outputs_per_mb)):
+                mtp_loss_ctx_list = loss_ctx_dict.get("mtp")
+                if mtp_loss_ctx_list is None:
+                    continue
+
+                micro_batch_mtp_losses = torch.tensor(0.0, device=DEVICE)
+                for mtp_idx, (mtp_hidden, mtp_ctx) in enumerate(zip(mtp_outputs, mtp_loss_ctx_list)):
+                    mtp_hidden_states, mtp_router_results, _ = mtp_hidden
+                    mtp_loss, _ = self.lm_head(mtp_hidden_states, cast(MTPLossContext, mtp_ctx))
+                    micro_batch_mtp_losses += mtp_loss
+
+                    if keep_router:
+                        router_logits_list[micro_batch_idx][f"mtp_layer{mtp_idx}"] = mtp_router_results
+
+                mtp_losses += micro_batch_mtp_losses / len(mtp_loss_ctx_list)
+                has_mtp_loss = True
+
+            if has_mtp_loss:
+                output["mtp_loss"] = mtp_losses * self.config.mtp_config.loss_scaling_factor
 
         # Apply final norm to all micro-batches
         cat_hidden_states = torch.cat(hidden_states_list, dim=1)
         cat_hidden_states = self.norm(cat_hidden_states)
 
         # Process final outputs for each micro-batch
-        cat_loss_ctx = CELossContext.cat(loss_ctx_list)
-        loss, (logits, extra_info) = self.lm_head(cat_hidden_states, cat_loss_ctx)
+        # Extract LM loss context from dict
+        lm_loss_ctx_list = [loss_ctx_dict["lm"] for loss_ctx_dict in loss_ctx_list]
+        cat_loss_ctx = type(lm_loss_ctx_list[0]).cat(lm_loss_ctx_list)
+        loss, (logits, extra_info) = self.lm_head(cat_hidden_states, cast(LMHeadLossContext, cat_loss_ctx))
 
         # Aggregate losses (mean across micro-batches)
         output["loss"] = loss.sum()
@@ -473,58 +617,20 @@ class MoE(BaseModel):
             moe_extra_info.append(extra_info)
         output["extra_info"] = moe_extra_info
 
-        # Handle router results for all micro-batches
-        all_router_logits = []
-        all_router_weights = []
+        split_aux_output = self.aux_loss.finalize(
+            balancing_ctx=balancing_ctx,
+            z_ctx=z_ctx,
+            non_pad_token=non_pad_token,
+        )
+        balancing_loss, z_loss, tokens_per_expert_global = split_aux_output
+        if balancing_loss is not None:
+            output["balancing_loss"] = balancing_loss
+        if z_loss is not None:
+            output["z_loss"] = z_loss
+        output["tokens_per_expert_global"] = tokens_per_expert_global
 
-        for micro_batch_idx, (micro_batch_router_logits, micro_batch_router_weights) in enumerate(
-            zip(router_logits_list, router_weights_list)
-        ):
-            if micro_batch_router_logits:
-                _router_logits_list = list(micro_batch_router_logits.values())
-                _router_weights_list = list(micro_batch_router_weights.values())
-
-                attn_mask = seq_ctx_list[micro_batch_idx].mask
-                router_logits = self._select_non_pad_router_logits(_router_logits_list, attn_mask)
-                router_weights = self._select_non_pad_router_logits(_router_weights_list, attn_mask)
-                all_router_logits.append(router_logits)
-                all_router_weights.append(router_weights)
-
-        if all_router_logits:
-            # Concatenate router logits from all micro-batches
-            combined_router_logits = torch.cat(all_router_logits, dim=1)  # [num_layers, total_seq, num_experts]
-            combined_router_weights = torch.cat(all_router_weights, dim=1)
-
-            # Calculate balancing loss across all micro-batches
-            batch_size = loss_ctx_list[0].batch_size if loss_ctx_list else 1
-            if self.balancing_loss:
-                balancing_loss = (
-                    self.balancing_loss(
-                        router_weights=combined_router_weights,
-                        n_routed_experts=self.config.n_routed_experts,
-                        num_experts_per_tok=self.config.num_experts_per_tok,
-                    )
-                    / batch_size
-                    * len(seq_ctx_list)
-                )
-                output["balancing_loss"] = balancing_loss
-
-            # Calculate z-loss across all micro-batches
-            if self.z_loss:
-                z_loss = self.z_loss(router_logits=combined_router_logits) / batch_size * len(seq_ctx_list)
-                output["z_loss"] = z_loss
-
-            # Calculate tokens per expert for bias update (if applicable)
-            tokens_per_expert_global = self._cal_tokens_per_expert(combined_router_logits)
-            output["tokens_per_expert_global"] = tokens_per_expert_global
-
-            del combined_router_logits
-
-        if self.config.return_router_results or return_router_logits:
-            # raise NotImplementedError
-
-            # TODO: Return router logits is costy
-
+        if keep_router:
+            # TODO: Returning router logits is costly.
             router_logits_dict: dict[str, torch.Tensor] = {}
             layer_names = list(router_logits_list[0].keys())
 
@@ -542,7 +648,7 @@ class MoE(BaseModel):
     def _forward(
         self,
         seq_ctx: SequenceContext,  # todo(@yehaochen): support intra layer micro-batch
-        loss_ctx: CELossContext | None,
+        loss_ctx: MoELossContextDict | None,
         return_router_logits: bool = False,
     ) -> MoEModelOutputs:
         input_ids = seq_ctx.input_ids
@@ -551,7 +657,14 @@ class MoE(BaseModel):
         if input_ids is not None:
             hidden_states = self.embed_tokens(input_ids)
         else:
-            hidden_states = seq_ctx.inputs_embeds
+            assert seq_ctx.inputs_embeds is not None, "inputs_embeds should not be None when input_ids is None"
+            # The clone here is mainly for ActivationOffload. The current offload implementation modifies
+            # the input tensor in-place, causing subsequent accesses to input_embeds to get a tensor with
+            # empty storage and trigger errors. So we clone here to ensure later accesses to input_embeds
+            # won't fail. However, there are two remaining caveats:
+            # 1. The extra clone may introduce a slight performance overhead.
+            # 2. hidden_states itself still cannot be reused, as offload will leave it with empty storage.
+            hidden_states = seq_ctx.inputs_embeds.clone()
 
         # create position embeddings to be shared across the decoder layers
         assert position_ids is not None
@@ -561,10 +674,22 @@ class MoE(BaseModel):
         if self.config.return_hidden_states:
             output["hidden_states"] = []
 
-        output["router_logits"] = {}
-        output["router_weights"] = {}
-
+        # Router logits / weights are only retained when a downstream consumer
+        # (config flag or per-call kwarg) asked for them; otherwise we skip the
+        # per-layer dict population and the optional D2H offload entirely.
+        keep_router = self.config.return_router_results or return_router_logits
+        if keep_router:
+            output["router_logits"] = {}
+            output["router_weights"] = {}
+        else:
+            output["router_logits"] = None
+            output["router_weights"] = None
         self._mark_dynamic(seq_ctx)
+        balancing_ctx, z_ctx = self._extract_aux_loss_ctx(loss_ctx)
+        # Hoisted out of the per-layer accumulate path: mask is constant across layers.
+        nonpad_indices = torch.nonzero(seq_ctx.mask, as_tuple=True)[1]
+        non_pad_token = nonpad_indices.numel()
+        num_tokens_global, z_world_size = self._z_loss_dist_token_count(z_ctx, non_pad_token, seq_ctx.mask.device)
 
         for idx, decoder_layer in self.layers.items():
             if int(idx) < self.config.first_k_dense_replace:
@@ -579,7 +704,7 @@ class MoE(BaseModel):
                         h2d_stream=self.offload_stream,
                         d2h_stream=self.offload_stream,
                         block_idx=int(idx),
-                        depth=len(self.layers),
+                        group="text",
                         custom_check_fn=lambda x: x.data_ptr() == hidden_states.data_ptr(),
                     ):
                         layer_results = decoder_layer(
@@ -595,52 +720,107 @@ class MoE(BaseModel):
                         seq_ctx=seq_ctx,
                     )
                 hidden_states, router_results, router_weights = layer_results
-                output["router_logits"][f"layer{idx}"] = router_results
-                output["router_weights"][f"layer{idx}"] = router_weights
+                if keep_router:
+                    output["router_logits"][f"layer{idx}"] = self._maybe_offload_router(router_results)
+                    output["router_weights"][f"layer{idx}"] = self._maybe_offload_router(router_weights)
+                hidden_states = self.aux_loss.accumulate(
+                    selected_router_weights=router_weights.index_select(0, nonpad_indices).contiguous().float(),
+                    selected_router_logits=router_results.index_select(0, nonpad_indices).contiguous().float(),
+                    hidden_states=hidden_states,
+                    balancing_ctx=balancing_ctx,
+                    z_ctx=z_ctx,
+                    num_tokens_local=non_pad_token,
+                    num_tokens_global=num_tokens_global,
+                    world_size=z_world_size,
+                )
 
             if self.config.return_hidden_states:
                 output["hidden_states"].append(hidden_states)
 
+        layer_hidden_states = hidden_states
         hidden_states = self.norm(hidden_states)
 
-        loss, (logits, extra_info) = self.lm_head(hidden_states, loss_ctx)  # type: ignore
+        # Get LM loss context from dict
+        lm_loss_ctx = loss_ctx["lm"] if loss_ctx is not None else None
+        loss, (logits, extra_info) = self.lm_head(hidden_states, lm_loss_ctx)  # type: ignore
         output["loss"] = loss
         output["logits"] = logits
         output["extra_info"] = extra_info
 
-        router_logits_list = list(output["router_logits"].values())  # type: ignore
-        router_weights_list = list(output["router_weights"].values())  # type: ignore
-        router_logits = self._select_non_pad_router_logits(router_logits_list, seq_ctx.mask)
-        router_weights = self._select_non_pad_router_logits(router_weights_list, seq_ctx.mask)
-
-        batch_size = loss_ctx.batch_size if loss_ctx is not None else 1
-        if self.balancing_loss:
-            balancing_loss = (
-                self.balancing_loss(
-                    router_weights=router_weights,
-                    n_routed_experts=self.config.n_routed_experts,
-                    num_experts_per_tok=self.config.num_experts_per_tok,
-                )
-                / batch_size
+        # MTP forward pass and loss computation
+        if (
+            self.mtp_block is not None
+            and loss_ctx is not None
+            and (mtp_loss_ctx_list := loss_ctx.get("mtp")) is not None
+        ):
+            mtp_seq_ctx = seq_ctx.copy(
+                input_ids=input_ids.clone() if input_ids is not None else None,
+                position_ids=position_ids.clone(),
+                inputs_embeds=seq_ctx.inputs_embeds.clone() if seq_ctx.inputs_embeds is not None else None,
             )
+            # MTP uses its own mask; main mask's non-pad indices do not apply.
+            mtp_nonpad_indices = torch.nonzero(mtp_seq_ctx.mask, as_tuple=True)[1]
+            mtp_non_pad_token = mtp_nonpad_indices.numel()
+            mtp_num_tokens_global, mtp_z_world_size = self._z_loss_dist_token_count(
+                z_ctx, mtp_non_pad_token, mtp_seq_ctx.mask.device
+            )
+
+            # Forward through MTP block
+            mtp_outputs = self.mtp_block(
+                layer_hidden_states,
+                embed_tokens_fn=self.embed_tokens,
+                position_embeddings=position_embeddings,
+                seq_ctx=mtp_seq_ctx,
+            )
+
+            # Compute MTP losses for each depth
+            mtp_losses = torch.tensor(0.0, device=DEVICE)
+            for idx, (mtp_hidden, mtp_ctx) in enumerate(zip(mtp_outputs, mtp_loss_ctx_list)):
+                mtp_hidden_states, mtp_router_results, mtp_router_weights = mtp_hidden
+
+                if keep_router:
+                    output["router_logits"][f"mtp_layer{idx}"] = mtp_router_results
+                    output["router_weights"][f"mtp_layer{idx}"] = mtp_router_weights
+                # Inject this MTP layer's z-loss before lm_head so backward through mtp_loss
+                # traverses the AuxLossScaler node and releases this layer's logsumexp activations.
+                mtp_hidden_states = self.aux_loss.accumulate(
+                    selected_router_weights=mtp_router_weights.index_select(0, mtp_nonpad_indices)
+                    .contiguous()
+                    .float(),
+                    selected_router_logits=mtp_router_results.index_select(0, mtp_nonpad_indices).contiguous().float(),
+                    hidden_states=mtp_hidden_states,
+                    balancing_ctx=balancing_ctx,
+                    z_ctx=z_ctx,
+                    num_tokens_local=mtp_non_pad_token,
+                    num_tokens_global=mtp_num_tokens_global,
+                    world_size=mtp_z_world_size,
+                )
+                mtp_loss, _ = self.lm_head(mtp_hidden_states, cast(MTPLossContext, mtp_ctx))
+                mtp_losses += mtp_loss
+
+            # Average MTP losses across depths and scale
+            mtp_losses = mtp_losses / len(mtp_loss_ctx_list)
+            scaled_mtp_loss = mtp_losses * self.config.mtp_config.loss_scaling_factor  # type: ignore
+
+            # Add to total loss
+            output["mtp_loss"] = scaled_mtp_loss
+
+        split_aux_output = self.aux_loss.finalize(
+            balancing_ctx=balancing_ctx,
+            z_ctx=z_ctx,
+            non_pad_token=non_pad_token,
+        )
+        balancing_loss, z_loss, tokens_per_expert_global = split_aux_output
+        if balancing_loss is not None:
             output["balancing_loss"] = balancing_loss
-
-        if self.z_loss:
-            z_loss = self.z_loss(router_logits=router_logits) / batch_size
+        if z_loss is not None:
             output["z_loss"] = z_loss
-
-        tokens_per_expert_global = self._cal_tokens_per_expert(router_logits)
         output["tokens_per_expert_global"] = tokens_per_expert_global
 
-        del router_logits
-
-        if self.config.return_router_results or return_router_logits:
-            # raise NotImplementedError
-            # TODO: Move router logits to CPU is cost
+        if keep_router:
+            # TODO: Moving router logits to CPU is costly.
             for layer_name, router_logits in output["router_logits"].items():
                 output["router_logits"][layer_name] = router_logits.detach().unsqueeze(0)
-        else:
-            output["router_logits"] = None
 
         return MoEModelOutputs(**output)
 
@@ -701,6 +881,7 @@ class MoE(BaseModel):
                     rope_scaling_cfg=config.rope_scaling_cfg,
                     generate_config=config.generate_config,
                     router_config=config.router,
+                    router_compute_dtype=config.router_compute_dtype,
                     moe_act_fn_cfg=config.moe_act_fn_cfg,
                     float8_cfg=config.float8_cfg,
                     layer_idx=layer_idx,
@@ -710,14 +891,80 @@ class MoE(BaseModel):
                 if self.config.freeze_routers:
                     layers[str(layer_idx)].gate.requires_grad_(False)
                     layers[str(layer_idx)].gate.eval()
-                    logger.info(f"Freeze MoE Router in layer {layer_idx}")
+                    log_rank0.info(f"Freeze MoE Router in layer {layer_idx}")
 
         layers.__class__.__repr__ = module_dict_repr  # type: ignore[method-assign]
         return layers
 
-    def build_rotary_embedding(self, config: MoEConfig) -> RotaryEmbeddingProtocol:
-        with torch.device(DEVICE):
-            return get_rope_embedding(config=config)
+    def build_mtp_block(self, config: MoEConfig) -> MTPBlock:
+        """Build MTP block with MoE decoder layers.
+
+        Args:
+            config (MoEConfig): Model configuration.
+
+        Returns:
+            MTPBlock: Constructed MTP block.
+        """
+        mtp_config = config.mtp_config
+        assert mtp_config is not None, "mtp_config must be provided"
+
+        mtp_layers = []
+        # Get attention config for MTP layers (use last layer's config)
+        last_layer_idx = config.num_hidden_layers - 1
+        layers_type_list = config.layers_type
+        attention_config: MLAConfig | MHAConfig | GatedDeltaNetConfig
+        if layers_type_list[last_layer_idx] in ["full_attention", "sliding_attention"]:
+            attention_config = config.attention
+        elif layers_type_list[last_layer_idx] == "linear_attention":
+            assert config.linear_attention is not None, (
+                "linear_attention config must be provided for linear_attention layer"
+            )
+            attention_config = config.linear_attention
+        else:
+            raise ValueError(f"Unsupported layer type {layers_type_list[last_layer_idx]}")
+
+        num_physical_layer = 1 if mtp_config.share_weights else mtp_config.num_layers
+        for i in range(num_physical_layer):
+            # Build MoE decoder layer for MTP
+            decoder_layer = MoEDecoderLayer(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                moe_intermediate_size=config.moe_intermediate_size,
+                mlp_bias=config.mlp_bias,
+                gate_bias=config.gate_bias,
+                moe_bias=config.moe_bias,
+                hidden_act=config.hidden_act,
+                rms_norm_eps=config.rms_norm_eps,
+                rms_norm_type=config.rms_norm_type,
+                num_experts_per_tok=config.num_experts_per_tok,
+                n_routed_experts=config.n_routed_experts,
+                n_shared_experts=config.n_shared_experts,
+                with_shared_expert_gate=config.with_shared_expert_gate,
+                hidden_factor=config.hidden_factor,
+                layer_type=layers_type_list[last_layer_idx],
+                attention_config=attention_config,
+                rope_scaling_cfg=config.rope_scaling_cfg,
+                generate_config=config.generate_config,
+                router_config=config.router,
+                router_compute_dtype=config.router_compute_dtype,
+                moe_act_fn_cfg=config.moe_act_fn_cfg,
+                float8_cfg=config.float8_cfg,
+                layer_idx=config.num_hidden_layers + i,
+                dispatcher=config.dispatcher,
+                ep_mesh=self.ep_mesh,
+            )
+
+            # Wrap decoder layer in MTPLayer
+            mtp_layer = MTPLayer(
+                hidden_size=config.hidden_size,
+                rms_norm_eps=config.rms_norm_eps,
+                rms_norm_type=config.rms_norm_type,
+                decoder_layer=decoder_layer,
+                float8_cfg=config.float8_cfg,
+            )
+            mtp_layers.append(mtp_layer)
+
+        return MTPBlock(mtp_config=mtp_config, mtp_layers=mtp_layers)
 
     @override
     def from_hf(self, hf_path: str | Path, strict: bool = True) -> tuple:
@@ -782,24 +1029,27 @@ class MoE(BaseModel):
         mp_policy = MixedPrecisionPolicy(
             param_dtype=self.fsdp_config.param_dtype, reduce_dtype=fsdp_config.reduce_dtype
         )
-        num_recompute_layers = int(self.config.num_hidden_layers * self.fsdp_config.recompute_ratio)
 
         for layer_idx, layer in tqdm(self.layers.items(), desc="[FSDP Sharding]"):
             layer_idx = int(layer_idx)
-            if layer_idx < num_recompute_layers - 1:
+            if self._should_recompute(
+                layer_idx=layer_idx,
+                mtp_idx=None,
+            ):
                 layer = checkpoint_wrapper(layer, checkpoint_impl=CheckpointImpl.REENTRANT)
 
             self.layers[str(layer_idx)] = layer
-            if layer_idx >= len(self.layers) - 1:
+            if layer_idx >= len(self.layers) - 1 and self.mtp_block is None:
                 reshard_after_forward = False
             else:
                 reshard_after_forward = self.fsdp_config.reshard_after_forward
-            fully_shard(
-                layer,
+
+            self._fully_shard(
                 mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
                 mp_policy=mp_policy,
                 reshard_after_forward=reshard_after_forward,
                 offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+                module=layer,
             )
 
         for layer_cur, layer_next in zip(
@@ -808,32 +1058,58 @@ class MoE(BaseModel):
         ):
             layer_cur.set_modules_to_forward_prefetch([layer_next])  # type: ignore
 
-        fully_shard(
-            self.embed_tokens,
+        self._fully_shard(
+            mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
+            mp_policy=mp_policy,
+            reshard_after_forward=self.config.embed_reshard_after_forward,
+            offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+            module=self.embed_tokens,
+        )
+
+        self._fully_shard(
             mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
             mp_policy=mp_policy,
             reshard_after_forward=self.fsdp_config.reshard_after_forward,
             offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+            module=self.norm,
         )
 
-        fully_shard(
-            self.norm,
-            mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
-            mp_policy=mp_policy,
-            reshard_after_forward=self.fsdp_config.reshard_after_forward,
-            offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
-        )
-
-        fully_shard(
-            self.lm_head,
+        self._fully_shard(
             mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
             mp_policy=lm_head_mp_policy,
-            reshard_after_forward=self.fsdp_config.reshard_after_forward,
+            reshard_after_forward=False,
             offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+            module=self.lm_head,
         )
 
-        fully_shard(
-            self,
+        # Shard MTP block if it exists
+        if self.mtp_block is not None:
+            for mtp_idx, mtp_layer in enumerate(self.mtp_block.layers):
+                if self._should_recompute(None, mtp_idx=mtp_idx) or (
+                    self.config.mtp_config is not None and self.config.mtp_config.share_weights
+                ):  # share mtp head must recompute
+                    mtp_layer = checkpoint_wrapper(mtp_layer, checkpoint_impl=CheckpointImpl.REENTRANT)
+                self.mtp_block.layers[mtp_idx] = mtp_layer
+
+                reshard_after_forward = mtp_idx != len(self.mtp_block.layers) - 1
+                self._fully_shard(
+                    mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
+                    mp_policy=mp_policy,
+                    reshard_after_forward=reshard_after_forward,
+                    offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+                    module=mtp_layer,
+                )
+                if mtp_idx == 0:
+                    layer_next.set_modules_to_forward_prefetch([mtp_layer])  # type: ignore
+
+            if self.config.mtp_config is not None and self.config.mtp_config.num_layers > 0:
+                for prev_mtp_layer, next_mtp_layer in zip(
+                    list(self.mtp_block.layers)[:-1],
+                    list(self.mtp_block.layers)[1:],
+                ):
+                    prev_mtp_layer.set_modules_to_forward_prefetch([next_mtp_layer])  # type: ignore
+
+        self._fully_shard(
             mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
             mp_policy=mp_policy,
             reshard_after_forward=self.fsdp_config.reshard_after_forward,
@@ -863,24 +1139,57 @@ class MoE(BaseModel):
 
     @torch.no_grad  # type: ignore
     def scale_and_reduce_grad(self):
+        ep_enabled = self.ep_mesh is not None and self.ep_mesh.size() > 1
+
+        # Bucket gradients that need a cross-rank reduction by their target process
+        # group. Each bucket is reduced with a single coalesced NCCL all_reduce
+        # instead of one launch per parameter, which used to dominate latency for
+        # models with many small replicated tensors.
+        grads_by_group: dict[dist.ProcessGroup, list[torch.Tensor]] = {}
+
         for name, param in self.trainable_parameters():
             if param.grad is None:
                 continue
 
-            ep_enabled = self.ep_mesh is not None and self.ep_mesh.size() > 1
-            # Scale moe parameters
+            # Expert parameters live on a unique EP rank, so no cross-rank reduction
+            # is needed — just rescale by `ep_size` to keep the effective average.
             if ep_enabled and ".experts" in name:
                 param.grad.div_(self.ep_mesh.size())  # type: ignore
                 continue
 
-            # Reduce gradients for other parameters
-            if ep_enabled:
-                grad = param.grad.to_local() if isinstance(param.grad, DTensor) else param.grad
-                dist.all_reduce(
-                    grad.div_(self.ep_mesh.size()),  # type: ignore
-                    ReduceOp.SUM,
-                    group=self.ep_mesh.get_group(mesh_dim=0),  # type: ignore
-                )
+            if not isinstance(param, DTensor):
+                continue
+
+            replicate_dim_names = tuple(
+                param.device_mesh.mesh_dim_names[i] for i, p in enumerate(param.placements) if isinstance(p, Replicate)
+            )
+            if not replicate_dim_names:
+                continue
+
+            # `DeviceMesh.get_group()` only supports a single mesh dimension,
+            # so calling it directly on a multi-dim sub-mesh raises RuntimeError.
+            # `_flatten()` collapses all Replicate dims into a 1D mesh whose
+            # process group covers every rank across those dimensions, allowing
+            # a single all_reduce regardless of how many Replicate dims exist.
+            if len(replicate_dim_names) > 1:
+                flat_mesh = param.device_mesh[replicate_dim_names]._flatten()
+            else:
+                # In the case that only one replicate dim, in pt2.8 _flatten is worked due to a bug.
+                # in pt2.9.1 this bug is fixed and _flatten will raise error when the mesh is already 1D,
+                # which means replicate_dim_names represents an existing single mesh dimension
+                # so we directly get the submesh without flatten in this case.
+                flat_mesh = param.device_mesh[replicate_dim_names[0]]
+
+            grad = param.grad.to_local() if isinstance(param.grad, DTensor) else param.grad
+            # Pre-scale locally so the SUM all_reduce below yields the mean across replicas.
+            grad.div_(flat_mesh.size())  # type: ignore
+            grads_by_group.setdefault(flat_mesh.get_group(), []).append(grad)  # type: ignore
+
+        # One coalesced all_reduce per process group covers all replicated grads.
+        for group, grads in grads_by_group.items():
+            with dist._coalescing_manager(group=group):
+                for grad in grads:
+                    dist.all_reduce(grad, ReduceOp.SUM, group=group)
 
     def _init_device_mesh(self, fsdp_config: FSDPConfig):
         self.fsdp_config = fsdp_config
@@ -895,6 +1204,7 @@ class MoE(BaseModel):
                 (experts_fsdp_size, self.fsdp_config.ep_size),
                 mesh_dim_names=(f"{self.config.mesh_prefix}.fsdp", f"{self.config.mesh_prefix}.ep"),
             )
+            self._world_mesh = model_mesh
             if self.ep_mesh is not None:
                 # WARN: This assertion is **VERY** important.
                 # FSDP requires that `device_mesh` shares the same root mesh across all mesh dimensions.
@@ -959,7 +1269,9 @@ class MoE(BaseModel):
             if isinstance(module, MoEBlock):
                 return
             for name, param in module.named_parameters(recurse=False):
-                dist_param = nn.Parameter(distribute_tensor(param, self.ep_mesh, [Replicate()]))
+                dist_param = nn.Parameter(
+                    distribute_tensor(param, self.ep_mesh, [Replicate()]), requires_grad=param.requires_grad
+                )
                 module.register_parameter(name, dist_param)
             for child in module.children():
                 traverse(child)
@@ -982,19 +1294,78 @@ class MoE(BaseModel):
             self.sparse,
         )
 
+    def _should_recompute(
+        self,
+        layer_idx: int | None,
+        mtp_idx: int | None,
+    ) -> bool:
+        """Determine if a layer should use gradient checkpointing
+        (recomputation).
+
+        The recomputation strategy treats decoder layers and MTP layers as a single
+        sequence. The recompute_ratio is applied to the total layer count. The last
+        layer in the entire model is never recomputed to avoid unnecessary overhead.
+
+        Args:
+            layer_idx (int | None): Index of the decoder layer (0-based). None if this
+                is an MTP layer.
+            mtp_idx (int | None): Index of the MTP layer (0-based). None if this is a
+                decoder layer.
+
+        Returns:
+            bool: True if the layer should use gradient checkpointing, False otherwise.
+
+        Example:
+            Configuration: 7 decoder layers, 3 MTP layers, recompute_ratio=0.8
+            - Total layers: 10
+            - Recompute layers: int(10 * 0.8) = 8
+            - Layer mapping:
+                * Decoder 0-6 → global index 0-6 (7 layers)
+                * MTP 0-2 → global index 7-9 (3 layers)
+            - Recomputation decision:
+                * Global 0-7 (decoder 0-6, MTP 0): recompute ✓
+                * Global 8 (MTP 1): no recompute
+                * Global 9 (MTP 2, last layer): no recompute (forced)
+        """
+        num_layers = self.config.num_hidden_layers
+        if self.config.mtp_config is not None:
+            mtp_layers = 1 if self.config.mtp_config.share_weights else self.config.mtp_config.num_layers
+        else:
+            mtp_layers = 0
+        recompute_ratio = self.fsdp_config.recompute_ratio if self.fsdp_config is not None else 0.0
+
+        total_layers = num_layers + mtp_layers
+        num_recompute_layers = int(total_layers * recompute_ratio)
+
+        # Determine the global layer index (0-based)
+        if layer_idx is not None:
+            # This is a decoder layer
+            global_idx = layer_idx
+        else:
+            # This is an MTP layer (comes after all decoder layers)
+            assert mtp_idx is not None, "Either layer_idx or mtp_idx must be provided"
+            global_idx = num_layers + mtp_idx
+
+        # Last layer is never recomputed
+        if global_idx == total_layers - 1:
+            return False
+
+        # Recompute if within the recompute range
+        return global_idx < num_recompute_layers
+
     # NOTE: Add this overload for inferring the return type for easier type checking and using
     @overload  # type: ignore
     def __call__(  # type: ignore
         self,
         seq_ctx: SequenceContext,
-        loss_ctx: CELossContext | None,
+        loss_ctx: MoELossContextDict | None,
     ) -> MoEModelOutputs: ...
 
     @overload  # type: ignore
     def __call__(  # type: ignore
         self,
         seq_ctx: list[SequenceContext],
-        loss_ctx: list[CELossContext],
+        loss_ctx: list[MoELossContextDict],
     ) -> MoEModelOutputs: ...
 
     __call__ = nn.Module.__call__

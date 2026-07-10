@@ -1,12 +1,13 @@
 from .compile import maybe_compile
 from .config import Config
 from .device import get_device, get_torch_device_module
-from .dtensor import is_evenly_distributed
+from .dist_utils import is_local_rank0
+from .dtensor import cal_total_norm, group_tensors_by_device_mesh_and_placements, is_evenly_distributed
 from .enum_helper import StrEnum
 from .exception_helper import ParallelConfigException
 from .init_weight import default_init_weights, init_params
 from .loader import HFCheckpointLoader
-from .logger import get_logger, log_format
+from .logger import get_logger, log_format, log_rank0
 from .misc import (
     XTUNER_DETERMINISTIC,
     FunctionEnum,
@@ -16,6 +17,8 @@ from .misc import (
     get_padding_length,
     is_hf_model_path,
     record_git_info,
+    set_deterministic,
+    trim_memory,
 )
 from .pad import pad_to_max_length, pad_to_multiple_of
 from .profile import profile_time, profile_time_and_memory, timer, timer_logger
@@ -28,6 +31,7 @@ IGNORE_INDEX = -100
 
 __all__ = [
     "get_logger",
+    "log_rank0",
     "SharedMemory",
     "StrEnum",
     "ForwardState",
@@ -50,6 +54,7 @@ __all__ = [
     "Config",
     "record_git_info",
     "is_hf_model_path",
+    "is_local_rank0",
     "copy_signature",
     "copy_method_signature",
     "init_params",
@@ -59,4 +64,8 @@ __all__ = [
     "ray_method",
     "profile_time",
     "clean_param_name",
+    "set_deterministic",
+    "trim_memory",
+    "group_tensors_by_device_mesh_and_placements",
+    "cal_total_norm",
 ]

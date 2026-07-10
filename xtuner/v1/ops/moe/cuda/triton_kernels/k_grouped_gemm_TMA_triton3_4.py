@@ -13,19 +13,20 @@ SM_MARGIN = int(os.environ.get("XTUNER_SM_MARGIN", 0))
 
 def get_cuda_autotune_config():
     return [
+        # BLOCK_M=256, BLOCK_N=128, BLOCK_K=64, num_stages=3 fits H200; first for XTUNER_DETERMINISTIC.
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 6}, num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 10}, num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 14}, num_stages=3, num_warps=8),
         triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 12}, num_stages=5, num_warps=8),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 6}, num_stages=5, num_warps=8),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 10}, num_stages=5, num_warps=8),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 14}, num_stages=5, num_warps=8),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 12}, num_stages=3, num_warps=8),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 12}, num_stages=5, num_warps=8),
-        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 6}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 6}, num_stages=5, num_warps=8),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 6}, num_stages=3, num_warps=8),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 6}, num_stages=5, num_warps=8),
-        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 10}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 10}, num_stages=5, num_warps=8),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 10}, num_stages=3, num_warps=8),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 10}, num_stages=5, num_warps=8),
-        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 14}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 14}, num_stages=5, num_warps=8),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 14}, num_stages=3, num_warps=8),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 14}, num_stages=5, num_warps=8),
     ]
@@ -278,7 +279,7 @@ if __name__ == "__main__":
         # post-process, row normalization
         out_triton = row_max_normalization(out_triton)
         out_ref = row_max_normalization(out_ref)
-        # breakpoint()
+
         torch.testing.assert_close(out_triton, out_ref, rtol=0.001, atol=0.01)
 
         print(f"{m = }, {n = }, {K = }")
