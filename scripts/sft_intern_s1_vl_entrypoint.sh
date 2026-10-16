@@ -6,7 +6,7 @@ export XTUNER_USE_FA3=1
 export XTUNER_SKIP_EMPTY_THINK=1
 export TORCH_LOGS="recompiles"
 export PYTHONPATH="$(pwd)"
-export HF_HOME="$(pwd)/"
+export HF_HOME="$(pwd)/tempdir"
 
 config_file=$1
 
